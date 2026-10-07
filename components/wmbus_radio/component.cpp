@@ -8,6 +8,8 @@
 
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/application.h"
+#include "esphome/core/version.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include <esp_heap_caps.h>  // heap_caps_get_free_size() for the outbox boot log / auto-sizing seed
@@ -23,6 +25,22 @@
 
 // Protocol constants shared with the split-out translation units (rf_runtime, ...).
 #include "wmbus_radio_internal.h"
+
+namespace {
+// Firmware identity for diag/boot ("fw"), detected at compile time instead of being
+// pinned to an ESPHome release: Application::get_build_time() / get_config_hash()
+// exist only in newer ESPHome, so the overload resolution below picks 0 on older
+// builds instead of failing to compile. A collector uses this to confirm an OTA by
+// what the board says it runs, not just by the fact that it rebooted.
+template<typename T> auto fw_build_time_(T &app, int) -> decltype((uint32_t) app.get_build_time()) {
+  return (uint32_t) app.get_build_time();
+}
+template<typename T> uint32_t fw_build_time_(T &, long) { return 0; }
+template<typename T> auto fw_config_hash_(T &app, int) -> decltype((uint32_t) app.get_config_hash()) {
+  return (uint32_t) app.get_config_hash();
+}
+template<typename T> uint32_t fw_config_hash_(T &, long) { return 0; }
+}  // namespace
 
 // xQueueCreate returns a handle (a pointer), xTaskCreate returns BaseType_t.
 // Funnel both through one overload set so a single format specifier stays
@@ -747,10 +765,15 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
   auto *mqtt = mqtt::global_mqtt_client;
   if (this->radio != nullptr && mqtt != nullptr && mqtt->is_connected() && !this->diag_topic_.empty()) {
     std::string boot_payload = str_sprintf(
-        "{\"event\":\"boot\",\"radio\":\"%s\",\"listen_mode\":\"%s\",\"uptime_ms\":%lu}",
+        "{\"event\":\"boot\",\"radio\":\"%s\",\"listen_mode\":\"%s\",\"uptime_ms\":%lu,"
+        "\"fw\":{\"esphome\":\"%s\",\"name\":\"%s\",\"build_time\":%lu,\"config_hash\":\"%08lx\"}}",
         this->radio->get_name(),
         listen_mode_to_string_(this->radio->get_listen_mode()),
-        (unsigned long) loop_now_ms);
+        (unsigned long) loop_now_ms,
+        ESPHOME_VERSION,
+        App.get_name().c_str(),
+        (unsigned long) fw_build_time_(App, 0),
+        (unsigned long) fw_config_hash_(App, 0));
 
     if (this->boot_info_mqtt_pending_) {
       std::string boot_topic = this->diag_topic_ + "/boot";
