@@ -766,14 +766,16 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
   if (this->radio != nullptr && mqtt != nullptr && mqtt->is_connected() && !this->diag_topic_.empty()) {
     std::string boot_payload = str_sprintf(
         "{\"event\":\"boot\",\"radio\":\"%s\",\"listen_mode\":\"%s\",\"uptime_ms\":%lu,"
-        "\"fw\":{\"esphome\":\"%s\",\"name\":\"%s\",\"build_time\":%lu,\"config_hash\":\"%08lx\"}}",
+        "\"fw\":{\"esphome\":\"%s\",\"name\":\"%s\",\"build_time\":%lu,\"config_hash\":\"%08lx\","
+        "\"mac\":\"%s\"}}",
         this->radio->get_name(),
         listen_mode_to_string_(this->radio->get_listen_mode()),
         (unsigned long) loop_now_ms,
         ESPHOME_VERSION,
         App.get_name().c_str(),
         (unsigned long) fw_build_time_(App, 0),
-        (unsigned long) fw_config_hash_(App, 0));
+        (unsigned long) fw_config_hash_(App, 0),
+        get_mac_address_pretty().c_str());
 
     if (this->boot_info_mqtt_pending_) {
       std::string boot_topic = this->diag_topic_ + "/boot";
