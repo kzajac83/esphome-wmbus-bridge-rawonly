@@ -12,6 +12,7 @@
 #include "esphome/core/version.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_netif.h"  // diag/boot "fw".ip - the address a collector uploads OTA to
 #include <esp_heap_caps.h>  // heap_caps_get_free_size() for the outbox boot log / auto-sizing seed
 
 #include <cstring>
@@ -40,6 +41,23 @@ template<typename T> auto fw_config_hash_(T &app, int) -> decltype((uint32_t) ap
   return (uint32_t) app.get_config_hash();
 }
 template<typename T> uint32_t fw_config_hash_(T &, long) { return 0; }
+
+// The board's own IPv4 address for diag/boot "fw".ip, read from ESP-IDF directly so it
+// does not depend on which ESPHome network component (ethernet or wifi) is in the build.
+// A collector in a container cannot resolve <name>.local, so OTA needs the address the
+// board actually has. Ethernet first (PoE boards), then the WiFi station; "" if neither.
+std::string fw_ip_() {
+  for (const char *key : {"ETH_DEF", "WIFI_STA_DEF"}) {
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey(key);
+    esp_netif_ip_info_t info;
+    if (netif != nullptr && esp_netif_get_ip_info(netif, &info) == ESP_OK && info.ip.addr != 0) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), IPSTR, IP2STR(&info.ip));
+      return buf;
+    }
+  }
+  return "";
+}
 }  // namespace
 
 // xQueueCreate returns a handle (a pointer), xTaskCreate returns BaseType_t.
@@ -767,7 +785,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
     std::string boot_payload = str_sprintf(
         "{\"event\":\"boot\",\"radio\":\"%s\",\"listen_mode\":\"%s\",\"uptime_ms\":%lu,"
         "\"fw\":{\"esphome\":\"%s\",\"name\":\"%s\",\"build_time\":%lu,\"config_hash\":\"%08lx\","
-        "\"mac\":\"%s\"}}",
+        "\"mac\":\"%s\",\"ip\":\"%s\"}}",
         this->radio->get_name(),
         listen_mode_to_string_(this->radio->get_listen_mode()),
         (unsigned long) loop_now_ms,
@@ -775,7 +793,8 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
         App.get_name().c_str(),
         (unsigned long) fw_build_time_(App, 0),
         (unsigned long) fw_config_hash_(App, 0),
-        get_mac_address_pretty().c_str());
+        get_mac_address_pretty().c_str(),
+        fw_ip_().c_str());
 
     if (this->boot_info_mqtt_pending_) {
       std::string boot_topic = this->diag_topic_ + "/boot";
