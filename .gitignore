@@ -4,8 +4,10 @@ __pycache__/
 .claude/
 .agents/
 _bmad/
-_bmad\
 _bmad-output/
+/secrets.yaml
+/.esphome/
+/wmbus-capture.csv
 
 # Local AI / BMAD workflow files
 /.agents/

@@ -254,7 +254,7 @@ A few options exist for advanced or development workflows. They are not needed f
 - `target_meter_id` — if set, frames from this single meter ID are routed to a separate path (used together with `target_topic` / `target_log`).
 - `target_topic` — alternative MQTT topic for the meter selected by `target_meter_id`.
 - `target_log` — when `true`, target-meter hits are logged on the device.
-- `publish_radio_raw` — dev-only raw radio tap published to a fixed topic `wmbus_bridge/raw`. This is not the normal validated telegram stream and should not be enabled in production.
+- `publish_radio_raw` — publishes raw radio captures before decoding and CRC validation. Set `radio_raw_topic` to override the default MQTT topic `wmbus_bridge/raw`.
 
 ## `listen_mode_filter_after_parse`
 

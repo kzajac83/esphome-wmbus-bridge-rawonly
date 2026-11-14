@@ -255,7 +255,7 @@ Nie są potrzebne w zwykłym użytkowaniu. Pełną tabelę zawiera
 - `target_meter_id` — przekierowuje ramki wskazanego licznika do osobnej ścieżki; używane razem z `target_topic` / `target_log`.
 - `target_topic` — alternatywny temat MQTT dla licznika wskazanego przez `target_meter_id`.
 - `target_log` — przy `true` trafienia wskazanego licznika są logowane na urządzeniu.
-- `publish_radio_raw` — deweloperski strumień surowych danych radiowych na stałym temacie `wmbus_bridge/raw`. Nie jest zwykłym strumieniem zweryfikowanych telegramów i nie powinien być włączany w instalacji produkcyjnej.
+- `publish_radio_raw` — publikuje surowe dane radiowe przed dekodowaniem i sprawdzeniem CRC. Opcja `radio_raw_topic` pozwala zmienić domyślny temat MQTT `wmbus_bridge/raw`.
 
 ## `listen_mode_filter_after_parse`
 

@@ -59,6 +59,7 @@ CONF_TARGET_METER_ID = "target_meter_id"
 CONF_TARGET_TOPIC = "target_topic"
 CONF_TARGET_LOG = "target_log"
 CONF_PUBLISH_RADIO_RAW = "publish_radio_raw"
+CONF_RADIO_RAW_TOPIC = "radio_raw_topic"
 CONF_PUBLISH_RSSI = "publish_rssi"
 CONF_FORWARD_METERS = "forward_meters"
 
@@ -586,6 +587,7 @@ BASE_CONFIG_SCHEMA = (
             cv.Optional(CONF_TARGET_LOG, default=True): cv.boolean,
             # Internal/dev-only raw packet tap. Fixed MQTT topic: wmbus_bridge/raw.
             cv.Optional(CONF_PUBLISH_RADIO_RAW, default=False): cv.boolean,
+            cv.Optional(CONF_RADIO_RAW_TOPIC): cv.publish_topic,
             # Publish the measured RSSI of each forwarded meter frame to
             # wmbus/<topic_name>/rssi/<meter_id>. Disabled by default.
             cv.Optional(CONF_PUBLISH_RSSI, default=False): cv.boolean,
@@ -793,7 +795,7 @@ _REPORT_RADIO = {
 }
 
 _REPORT_OUTPUT = (CONF_TOPIC_NAME, CONF_TELEGRAM_TOPIC, CONF_PUBLISH_RSSI,
-                  CONF_FORWARD_METERS, CONF_TARGET_METER_ID, CONF_PUBLISH_RADIO_RAW,
+                  CONF_FORWARD_METERS, CONF_TARGET_METER_ID, CONF_PUBLISH_RADIO_RAW, CONF_RADIO_RAW_TOPIC,
                   CONF_TELEGRAM_QOS, CONF_RSSI_QOS, CONF_HEALTH_QOS, CONF_DIAGNOSTIC_QOS,
                   CONF_RX_QOS, CONF_MQTT_BUFFER_SIZE, CONF_BUFFER_PRIORITY)
 
@@ -1383,6 +1385,8 @@ async def to_code(config):
     cg.add(var.set_target_topic(config.get(CONF_TARGET_TOPIC, "")))
     cg.add(var.set_target_log(config.get(CONF_TARGET_LOG, True)))
     cg.add(var.set_publish_radio_raw(config.get(CONF_PUBLISH_RADIO_RAW, False)))
+    if CONF_RADIO_RAW_TOPIC in config:
+        cg.add(var.set_radio_raw_topic(config[CONF_RADIO_RAW_TOPIC]))
     cg.add(var.set_publish_rssi(config.get(CONF_PUBLISH_RSSI, False)))
 
     cg.add(var.set_telegram_qos(config[CONF_TELEGRAM_QOS]))

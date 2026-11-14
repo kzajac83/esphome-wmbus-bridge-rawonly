@@ -58,6 +58,7 @@ public:
   void set_target_topic(const std::string &topic) { this->target_topic_ = topic; }
   void set_target_log(bool enabled) { this->target_log_ = enabled; }
   void set_publish_radio_raw(bool enabled) { this->publish_radio_raw_ = enabled; }
+  void set_radio_raw_topic(const std::string &topic) { this->radio_raw_topic_ = topic; }
   void set_publish_rssi(bool enabled) { this->publish_rssi_ = enabled; }
 
   // Per-topic MQTT QoS (0/1/2). Defaults all preserve the pre-existing
@@ -325,6 +326,7 @@ protected:
   std::string target_topic_{};
   bool target_log_{true};
   bool publish_radio_raw_{false};
+  std::string radio_raw_topic_{"wmbus_bridge/raw"};
   bool publish_rssi_{false};
 
   // Per-topic QoS, see the set_*_qos() setters above.

@@ -69,6 +69,8 @@ Nie robi:
 
 ## Szybki start
 
+Nasłuch na 868,300 MHz na LilyGO T3 v1.6.1 opisuje [instrukcja wgrania przez ESPHome Device Builder i zapisu do CSV](T2_CAPTURE_PL.md).
+
 Użyj jednego z przykładów YAML z `examples/`, a potem najpierw przeczytaj log startowy, zanim zaczniesz zmieniać kolejne rzeczy.
 
 > **Wymagania.** Komponent buduje się i działa na frameworku ESP-IDF (używa go każdy przykład) i publikuje na bezwzględne tematy MQTT w postaci `wmbus/<topic_name>/telegram` — nie ma konfigurowalnego prefiksu tematu.

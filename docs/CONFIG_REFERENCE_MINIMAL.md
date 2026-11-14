@@ -217,7 +217,8 @@ is getting through, rather than RSSI alone.
 | `target_meter_id` | `""` | advanced | separate forwarding of one meter |
 | `target_topic` | `""` | advanced | topic for `target_meter_id` |
 | `target_log` | `true` | advanced | log target-meter matches |
-| `publish_radio_raw` | `false` | dev-only | raw radio tap on the fixed `wmbus_bridge/raw` topic; different from a normal telegram |
+| `publish_radio_raw` | `false` | dev-only | publishes the raw radio capture before decoding and CRC validation |
+| `radio_raw_topic` | `wmbus_bridge/raw` | dev-only | MQTT topic used by `publish_radio_raw` |
 | `diagnostic_publish_suggestion` | from `diagnostic_mode` preset | advanced | publish `suggestion` events, throttled to one per hour per code; explicit `true`/`false` overrides the preset |
 
 ## Deprecated diagnostic aliases

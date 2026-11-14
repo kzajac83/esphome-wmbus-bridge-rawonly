@@ -78,7 +78,7 @@ void Radio::maybe_publish_radio_raw_(Packet *packet, uint32_t now_ms) {
       (unsigned) raw.size(),
       raw.c_str());
 
-  mqtt->publish("wmbus_bridge/raw", payload, static_cast<uint8_t>(0), false);
+  mqtt->publish(this->radio_raw_topic_, payload, static_cast<uint8_t>(0), false);
 }
 
 void Radio::maybe_forward_frame_(Frame &frame, uint32_t meter_id, uint32_t meter_id_raw, const char *id_str,
