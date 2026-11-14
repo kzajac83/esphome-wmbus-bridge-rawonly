@@ -13,17 +13,29 @@ Każdy profil zajmuje jeden odbiornik. Do równoczesnego nasłuchu obu kierunkó
 
 ## Firmware w ESPHome Device Builder w Home Assistant
 
-1. Dodaj konfigurację `lilygo-t2-capture.yaml` do katalogu konfiguracji Device Buildera lub wklej ją do edytora YAML nowego urządzenia. Builder pobierze komponent z forka przy kompilacji.
-2. Dopisz brakujące wpisy do pliku `secrets.yaml` Device Buildera według `secrets.example.yaml`. Wpisz własne dane Wi-Fi, adres i dane brokera MQTT oraz hasło przyszłych aktualizacji OTA. Jeśli broker Mosquitto działa jako dodatek w HA, podaj adres IP hosta HA dostępny z Wi-Fi ESP32. Dla brokera bez uwierzytelniania ustaw `mqtt_user` i `mqtt_password` na `""`. Jeśli masz już te sekrety pod innymi nazwami, dopasuj odwołania `!secret` w YAML.
-3. Podłącz antenę 868 MHz i wyjmij kartę SD przed wgrywaniem. W Device Builderze wybierz **Install**. Jeśli płytka jest podłączona przez USB do komputera z przeglądarką, wybierz instalację z tego komputera przez USB. Jeśli jest podłączona przez USB do hosta Home Assistant, wybierz instalację przez USB z hosta. **Manual download** pobiera plik `.bin` do samodzielnego wgrania. Do ręcznej instalacji przez USB wybierz format **Factory**. Po udanym wgraniu i połączeniu z Wi-Fi kolejne wersje można instalować przez **Wirelessly** (OTA).
+1. Dla istniejącego urządzenia `lora-lilygo-t3-wmbus-ble` wgraj [dopasowany YAML z BLE i OLED](lora-lilygo-t3-wmbus-ble.yaml) przez edytor YAML jego karty. Plik używa dotychczasowych wpisów `wifi_ssid_ha`, `wifi_password_ha`, `t3_api_key`, `t3_ota_password`, `mqtt_broker`, `mqtt_user` i `mqtt_password`. Jeśli pełny bieżący plik zawiera dodatkowe sekcje, skopiuj do niego zmiany w `external_components`, `wmbus_radio`, `globals`, `sensor` i `display`, zachowując własne dodatki. Dla osobnej płytki możesz użyć prostszego [YAML-a](lilygo-t2-capture.yaml) z [przykładem sekretów](secrets.example.yaml).
+2. Jeśli broker Mosquitto działa jako dodatek w HA, jego adres w konfiguracji to adres IP hosta HA dostępny z Wi-Fi ESP32. Dla brokera bez uwierzytelniania ustaw `mqtt_user` i `mqtt_password` na `""`. Builder pobiera komponent z forka przy kompilacji.
+3. Jeżeli obecna płytka jest online i ma działające OTA, wybierz **Install → Wirelessly**. Przy wgrywaniu przez USB wybierz komputer z przeglądarką lub host Home Assistant, zależnie od tego, gdzie podłączona jest płytka. Wyjmij kartę SD przed wgrywaniem przez USB. **Manual download** pobiera plik `.bin` do samodzielnego wgrania. Do ręcznej instalacji przez USB wybierz format **Factory**.
 
 Dokumentacja: [ESPHome Device Builder](https://esphome.io/install/), [komponenty z GitHuba](https://esphome.io/components/external_components/), [aktualizacje OTA](https://esphome.io/components/ota/esphome/).
+
+Jeśli po aktualizacji OLED nadal pokazuje `868.950 MHz`, sprawdź w logu `listen_mode` i w ustawieniach dotychczasowego bridge’a przywróć tryb z YAML. MQTT może w tym celu opublikować tekst `yaml` na `wmbus/lilygo-t3/set/listen_mode` bez flagi retain. Zapisana wcześniej opcja z dodatku może nadpisywać YAML przy starcie.
 
 Jeśli wgrywasz przez lokalne ESPHome na Windows, uzupełnij `secrets.yaml` obok konfiguracji i podstaw właściwy port:
 
 ```powershell
 esphome run lilygo-t2-capture.yaml --device COM5
 ```
+
+## Co pokazuje OLED
+
+- `RAW` to liczba zrzutów z kolejki odbiornika od startu, także przy rozłączonym MQTT.
+- `CRC OK` to liczba ramek, które parser zdekodował i zweryfikował.
+- `RSSI` i `B` pokazują poziom sygnału i liczbę bajtów ostatniego zrzutu.
+- `ADR` pokazuje cztery bajty identyfikatora z pola adresowego ostatniej zweryfikowanej ramki w HEX. W wymianie dwukierunkowej może to być identyfikator czytnika.
+- `MQTT` lub `OFF` informuje o połączeniu z brokerem. Liczba wierszy CSV zależy także od działania rejestratora.
+
+Liczniki `RAW` i `CRC OK` są też dostępne jako encje diagnostyczne w Home Assistant.
 
 ## Zapis CSV z brokera MQTT
 

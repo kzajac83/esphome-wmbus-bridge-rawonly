@@ -585,7 +585,7 @@ BASE_CONFIG_SCHEMA = (
             cv.Optional(CONF_TARGET_METER_ID, default=""): cv.string,
             cv.Optional(CONF_TARGET_TOPIC, default=""): cv.string,
             cv.Optional(CONF_TARGET_LOG, default=True): cv.boolean,
-            # Internal/dev-only raw packet tap. Fixed MQTT topic: wmbus_bridge/raw.
+            # Raw packet tap. Defaults to the wmbus_bridge/raw MQTT topic.
             cv.Optional(CONF_PUBLISH_RADIO_RAW, default=False): cv.boolean,
             cv.Optional(CONF_RADIO_RAW_TOPIC): cv.publish_topic,
             # Publish the measured RSSI of each forwarded meter frame to

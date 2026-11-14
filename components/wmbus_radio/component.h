@@ -218,11 +218,24 @@ public:
 
   void add_frame_handler(std::function<void(Frame *)> &&callback);
 
+  struct RawCaptureStats {
+    uint32_t count{0};
+    size_t last_size{0};
+    int8_t last_rssi_dbm{-127};
+  };
+  // Access from the ESPHome main loop. Captures are counted before parsing
+  // and MQTT, so local diagnostics work with the broker disconnected.
+  const RawCaptureStats &get_raw_capture_stats() const { return this->raw_capture_stats_; }
+  ListenMode get_active_listen_mode() const {
+    return this->radio == nullptr ? LISTEN_MODE_BOTH : this->radio->get_listen_mode();
+  }
+
 protected:
   static void wakeup_receiver_task_from_isr(TaskHandle_t *arg);
   static void receiver_task(Radio *arg);
 
   RadioTransceiver *radio{nullptr};
+  RawCaptureStats raw_capture_stats_{};
   TaskHandle_t receiver_task_handle_{nullptr};
   QueueHandle_t packet_queue_{nullptr};
   // Stack for the dedicated radio_recv task. Default stays at 3 KB so existing

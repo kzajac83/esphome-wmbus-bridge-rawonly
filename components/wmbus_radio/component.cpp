@@ -838,6 +838,9 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
   if (xQueueReceive(this->packet_queue_, &p, 0) != pdPASS)
     return;
 
+  this->raw_capture_stats_.count++;
+  this->raw_capture_stats_.last_size = p->size();
+  this->raw_capture_stats_.last_rssi_dbm = p->get_rssi();
   this->maybe_publish_radio_raw_(p, loop_now_ms);
 
   // listen_mode filtering has two modes:
