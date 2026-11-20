@@ -13,8 +13,9 @@
 | `diagnostic_mode` | `off` | publiczna | `off`, `low`, `normal`, `debug`, `dev` |
 | `log_language` | `en` | publiczna | język komunikatów w logu urządzenia: `en` albo `pl`; do firmware trafia tylko wybrany. Nie wpływa na dane MQTT |
 | `highlight_meters` | puste | publiczna | ID liczników do wyróżnienia i statystyk w `normal/debug`; **nie filtruje MQTT** |
-| `forward_meters` | puste | publiczna | whitelista ID publikowanych na `wmbus/<topic_name>/telegram`; lista ID albo `true` = użyj `highlight_meters`; puste = wysyłaj wszystko |
+| `forward_meters` | puste | publiczna | whitelista ID publikowanych na `wmbus/<topic_name>/telegram`; lista ID albo `true` = użyj `highlight_meters`; puste = wysyłaj wszystko. Dla zaawansowanych: własna lambda może ją podmienić w trakcie pracy przez `id(<id wmbus_radio>).set_forward_meters("id1,id2")` (pusty tekst = wszystko), np. z `mqtt: on_message:`; zmiana trafia do logu, a `<diag>/config` pokazuje ją jako CHANGED at runtime |
 | `publish_rssi` | `false` | publiczna | publikuj RSSI ostatniej ramki każdego licznika na `wmbus/<topic_name>/rssi/<meter_id>`; patrz sekcja niżej |
+| `repeater` | `false` | publiczna | tylko odbiornik radiowy: bez MQTT w ogóle (bez tematów, bufora i statystyk awarii), ramki wychodzą tylko przez `on_frame` (np. ESP-NOW do płytki-mostu, gotowy układ w [`examples/repeater-espnow`](../examples/repeater-espnow/README_PL.md)); YAML może wtedy nie mieć `mqtt:` |
 | `receiver_task_stack_size` | `3072` | zaawansowana | stos osobnego taska RX, zakres `2048..16384` |
 | `listen_mode_filter_after_parse` | `false` | eksperymentalna | agresywniejsze filtrowanie po parserze; testować po licznikach, nie po samym globalnym drop% |
 | `use_noise_floor_threshold` | `false` | eksperymentalna | próg przerywania słabych startów liczony od ZMIERZONEJ podłogi szumu zamiast od średniej udanych odbiorów; pomiar (`noise_floor_dbm`) działa zawsze, ta opcja tylko go używa |
@@ -23,7 +24,7 @@
 | `highlight_tag` | `wmbus_user` | publiczna | tag logu dla wyróżnionych liczników |
 | `highlight_prefix` | `"★ "` | publiczna | prefiks linii logu wyróżnionego licznika |
 | `allow_untested_framework` | `false` | wymaga jawnej zgody | wymagane do zbudowania na frameworku `arduino`; domyślnie kompilacja jest przerywana |
-| `mark_as_handled` | `false` | publiczna | opcja wewnątrz `on_frame:`; oznacza ramkę jako obsłużoną |
+| `mark_as_handled` | `false` | publiczna | opcja wewnątrz `on_frame:`; liczy ramkę jako obsłużoną w logu; **nie** wyłącza publikacji MQTT (do tego `repeater` albo `forward_meters`) |
 
 ## Tryby nasłuchu i częstotliwość
 
@@ -52,9 +53,10 @@ Poprawny telegram S1 jest publikowany na `wmbus/<topic_name>/telegram` tak samo 
 | `dio2_rf_switch` | `SX1262` | `true` | publiczna | sterowanie przełącznikiem RF przez DIO2 |
 | `rx_gain` | `SX1262` | `boosted` | publiczna | `boosted` albo `power_saving` |
 | `long_gfsk_packets` | `SX1262` | `false` | publiczna | zalecane dla długich ramek T1; brak może powodować ucinanie/dropy. Gdy licznik w zasięgu tego wymaga, płytka to zgłasza: ostrzeżenie w logu i sugestia `ENABLE_LONG_GFSK_PACKETS`, po dwukrotnym odebraniu tej samej za długiej ramki T1 |
-| `sx1262_rx_bandwidth` | `SX1262` | `312khz` | publiczna | `312khz` (domyślne, odziedziczone, niezmierzone dla T1), `234khz`, `156khz`. Działa dla `listen_mode: t1`, `both` **i `c1`**; `s1` ignoruje — jego 234,3 kHz jest zmierzone i przypięte. Do 25.09.2026 `c1` też był przypięty do 234,3 kHz, wartości zmierzonej tylko dla S1 |
+| `sx1262_rx_bandwidth` | `SX1262` | `234khz` | publiczna | `234khz` (domyślne od 15.11.2026, zmierzone jako lepsze od 312 kHz dla T1 i C1), `312khz` (wartość odziedziczona, wcześniej domyślna), `156khz`. Działa dla `listen_mode: t1`, `both` **i `c1`**; `s1` ignoruje — jego 234,3 kHz jest zmierzone i przypięte. Do 25.09.2026 `c1` też był przypięty do 234,3 kHz, wartości zmierzonej tylko dla S1 |
 | `fem_ctrl_pin`, `fem_en_pin`, `fem_pa_pin` | `SX1262` | brak | zależna od płytki | piny zewnętrznego front-endu RF, np. Heltec V4 |
 | `rf_sw_pin` | `SX1262` | brak | zależna od płytki | bramka wewnętrznego przełącznika RF modułu; wymagane na XIAO ESP32-S3 + Wio-SX1262 (`GPIO38`), inaczej czułość niższa o ~30 dB |
+| `cc1101_rx_bandwidth` | `CC1101` | `232khz` | public | filtr odbiornika T1/C1: `232khz` (domyślne od 16.11.2026, zmierzone jako lepsze od 325 kHz przy progu, bez strat na mocnych ramkach), `325khz` (TI AN067, obejmuje też liczniki ze skrajnym przesunięciem częstotliwości), `270khz`. Tylko w YAML. |
 | `sx1276_busy_ether_mode` | `SX1276` | `normal` | publiczna | `normal`, `aggressive`, `adaptive`; podnosić dopiero przy **zmierzonym** przeciążeniu (`fifo_overrun`/`truncated` > 0) — `adaptive` przerywa słabe starty i kosztuje ok. 12 dB czułości |
 | `tcxo_pin` | `SX1276` | brak | zależna od płytki | opcjonalny pin TCXO enable; ustawiany HIGH przed inicjalizacją SX1276 |
 | `busy_pin` | `SX1262`, `LR1121` | wymagane | publiczna | linia BUSY; bez niej sterownik nie odróżni „jeszcze nie gotowy" od „odpowiedział" |
@@ -96,9 +98,9 @@ Preferuj `topic_name`.
 | `wmbus/<topic_name>/diag/summary_60min` | co 60 min | tylko `dev`, chyba że wymusisz stare flagi |
 | `wmbus/<topic_name>/diag/meter_snapshot` | snapshot liczników | `normal`+ z `highlight_meters`; w `dev` wszystkie |
 | `wmbus/<topic_name>/diag/boot` | raz po starcie | `retain=true`; boot idzie też jako kopia do root `diag` bez retain |
-| `wmbus/<topic_name>/diag/config` | raz po starcie | `retain=true`; snapshot efektywnej konfiguracji (`{radio, lines[]}`) - konsumowany przez panel diagnostyczny dodatku |
-| `wmbus/<topic_name>/diag/settings` | raz po starcie | `retain=true`; ustawienia, które dodatek może zmieniać bez kompilacji (`{v, radio, listen_mode{value, source, yaml, options, unsupported, weak}}`) |
-| `wmbus/<topic_name>/set/listen_mode` | subskrybowany | `t1`, `c1`, `both`, `s1` albo `yaml`; zapis we flashu, potem restart płytki. Zapisany tryb wygrywa z YAML, dopóki nie przyjdzie `yaml` (albo sam tryb z YAML) |
+| `wmbus/<topic_name>/diag/config` | raz po starcie | `retain=true`; snapshot efektywnej konfiguracji (`{radio, lines[]}`), konsumowany przez kafelki płytek w dodatku. Publikowany przy każdym `diagnostic_mode`, także `off` |
+| `wmbus/<topic_name>/diag/settings` | raz po starcie | `retain=true`; ustawienia, które dodatek może zmieniać bez kompilacji (`{v, radio, listen_mode{value, source, yaml, options, unsupported, weak}, <klucz>{value, source, yaml, options}...}`). Publikowany przy każdym `diagnostic_mode`, także `off` |
+| `wmbus/<topic_name>/set/<klucz>` | subskrybowany | `listen_mode` (`t1`, `c1`, `both`, `s1`), `diagnostic_mode` (`off`, `low`, `normal`, `debug`), `publish_rssi` (`true`, `false`), na SX1262 `rx_gain` (`boosted`, `power_saving`) i `long_gfsk_packets` (`true`, `false`), na SX1276 `sx1276_busy_ether_mode` (`normal`, `aggressive`, `adaptive`); albo `yaml`. Zapis we flashu, potem restart płytki. Zapisana wartość wygrywa z YAML, dopóki nie przyjdzie `yaml` (albo sama wartość z YAML) |
 | `wmbus/<topic_name>/diag/suggestion` | wykryta anomalia RF | sugestie diagnostyczne |
 | `wmbus/<topic_name>/diag/busy_ether_changed` | zmiana stanu busy-ether | SX1276 + `adaptive` |
 | `wmbus/<topic_name>/rssi/<meter_id>` | ramka z realnym pomiarem RSSI | tylko przy `publish_rssi: true`; `retain=true` |

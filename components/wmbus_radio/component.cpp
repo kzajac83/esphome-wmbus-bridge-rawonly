@@ -8,6 +8,11 @@
 
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+// ESPHome 2026.11 moved str_sprintf()/format_hex() to alloc_helpers.h, which
+// helpers.h no longer pulls in. Older releases have no such header.
+#if __has_include("esphome/core/alloc_helpers.h")
+#include "esphome/core/alloc_helpers.h"
+#endif
 #include "esp_system.h"
 #include "esp_timer.h"
 #include <esp_heap_caps.h>  // heap_caps_get_free_size() for the outbox boot log / auto-sizing seed
@@ -20,7 +25,9 @@
 #include <cinttypes>
 
 // Optional: publish diagnostics via ESPHome MQTT if mqtt component is present.
-#include "esphome/components/mqtt/mqtt_client.h"
+#include "mqtt_access.h"
+#include "log_anon.h"
+#include <esp_random.h>  // esp_random(): came in through mqtt_client.h before repeater builds dropped it
 #include "esphome/core/application.h"
 #include "runtime_settings.h"
 
@@ -51,6 +58,10 @@ static inline intptr_t assert_result_value(intptr_t value) { return value; }
 namespace esphome {
 namespace wmbus_radio {
 static const char *TAG = "wmbus";
+
+bool g_repeater_mode = false;  // see mqtt_access.h
+Radio *global_radio = nullptr;  // see component.h
+bool g_log_anonymize = false;  // see log_anon.h
 
 // Logging policy for this component:
 // - important user-facing INFO/WARN/ERROR messages may be concise bilingual EN/PL,
@@ -178,11 +189,45 @@ static void parse_meter_priority_csv_(const std::string &csv,
   }
 }
 
+// Runtime replacement of forward_meters (contributed by Alexander Streit for
+// several boards fed from one wmbusmeters meter list). Runs on the main loop
+// (an mqtt on_message lambda), the same thread that filters frames, so the
+// lists can be swapped without a lock.
+void Radio::set_forward_meters(const std::string &csv) {
+  // A retained command comes back on every MQTT reconnect: same list, nothing to do.
+  if (this->forward_meters_runtime_modified_ && csv == this->forward_meters_csv_) return;
+  this->forward_meters_csv_ = csv;
+  this->forward_meters_inherited_ = false;
+  this->forward_meters_runtime_modified_ = true;
+  this->forward_meter_ids_.clear();
+  this->forward_meter_raw_ids_.clear();
+  parse_meter_id_csv_(this->forward_meters_csv_, this->forward_meter_ids_, this->forward_meter_raw_ids_,
+                      "forward_meters");
+  if (this->setup_done_) this->recompute_buffer_quotas_();
+  const std::string summary = this->forward_whitelist_summary_();
+  ESP_LOGI(TAG, LOG_TR("forward_meters changed at runtime: %s", "forward_meters zmienione w trakcie pracy: %s"),
+           summary.c_str());
+  // The configuration report is a snapshot from the build; patch its
+  // forward_meters line and publish it again, so the add-on (and anyone reading
+  // <diag>/config) sees that this board is filtered by a list set at runtime.
+  const std::string head = "  forward_meters: ";
+  for (auto &line : this->config_report_) {
+    if (line.rfind(head, 0) != 0) continue;
+    if (this->forward_meters_yaml_line_.empty()) this->forward_meters_yaml_line_ = line.substr(head.size());
+    line = head + summary + " (CHANGED at runtime; YAML: " + this->forward_meters_yaml_line_ + ")";
+    this->config_report_mqtt_pending_ = true;
+    break;
+  }
+}
+
 std::string Radio::forward_whitelist_summary_() const {
   const size_t bcd_n = this->forward_meter_ids_.size();
   const size_t raw_n = this->forward_meter_raw_ids_.size();
   if (bcd_n == 0 && raw_n == 0)
-    return LOG_TR("disabled - every decoded frame is published", "wylaczona - publikowana jest kazda ramka");
+    return this->forward_meters_runtime_modified_
+               ? LOG_TR("disabled (modified at runtime) - every decoded frame is published",
+                        "wylaczona (zmieniona w trakcie pracy) - publikowana jest kazda ramka")
+               : LOG_TR("disabled - every decoded frame is published", "wylaczona - publikowana jest kazda ramka");
 
   // List the parsed IDs, not just the count: a mistyped entry is only obvious
   // when the resulting values are visible. Each form is printed the way the log
@@ -212,8 +257,9 @@ std::string Radio::forward_whitelist_summary_() const {
   if (bcd_n + raw_n > log_limit)
     ids += ", ... (+" + std::to_string(bcd_n + raw_n - log_limit) + ")";
 
-  return std::to_string(bcd_n + raw_n) + " ids" +
-         (this->forward_meters_inherited_ ? " (from highlight_meters)" : "") + ": " + ids;
+  std::string suffix = this->forward_meters_inherited_ ? " (from highlight_meters)" : "";
+  if (this->forward_meters_runtime_modified_) suffix += " (modified at runtime)";
+  return std::to_string(bcd_n + raw_n) + " ids" + suffix + ": " + ids;
 }
 
 static bool radio_supports_preamble_retry_(const RadioTransceiver *radio) {
@@ -238,10 +284,20 @@ static inline uint8_t rssi_abort_bucket_(int rssi_dbm) {
 }
 
 void Radio::setup() {
+  global_radio = this;
   // One random identifier per boot separates sequence-number domains. It is
   // metadata only; no radio setting or packet path depends on its value.
   this->rx_boot_id_ = esp_random();
   if (this->rx_boot_id_ == 0) this->rx_boot_id_ = 1;
+  // Options the add-on stored (runtime_settings.h) replace the YAML ones
+  // before anything below reads them.
+  this->publish_rssi_opt_.load();
+  if (this->publish_rssi_opt_.stored) this->publish_rssi_ = this->publish_rssi_opt_.value == 1;
+  this->busy_ether_opt_.load();
+  if (this->busy_ether_opt_.stored)
+    this->sx1276_busy_ether_mode_ = static_cast<SX1276BusyEtherMode>(this->busy_ether_opt_.value);
+  this->diag_mode_opt_.load();
+  if (this->diag_mode_opt_.stored) this->apply_diag_preset_(this->diag_mode_opt_.value);
   for (const auto &warning : this->config_warnings_) {
     ESP_LOGW(TAG, LOG_TR("Config warning: %s", "Ostrzezenie konfiguracji: %s"), warning.c_str());
   }
@@ -272,7 +328,10 @@ void Radio::setup() {
     }
   }
 
-  if (!this->telegram_topic_.empty()) {
+  if (this->repeater_) {
+    ESP_LOGI(TAG, LOG_TR("repeater: true -> no MQTT; frames leave only through on_frame",
+                         "repeater: true -> bez MQTT; ramki wychodza tylko przez on_frame"));
+  } else if (!this->telegram_topic_.empty()) {
     ESP_LOGI(TAG, LOG_TR("Frame RAW forwarding topic: %s", "Topic publikacji RAW: %s"), this->telegram_topic_.c_str());
     ESP_LOGI(TAG, LOG_TR("Frame RX metadata topic: %s", "Topic metadanych RX: %s"), this->rx_topic_.c_str());
   }
@@ -477,9 +536,9 @@ void Radio::loop() {
       const auto diagnostic = this->radio->runtime_diag_json();
       if (!diagnostic.empty()) {
         if (this->diag_verbose_) ESP_LOGI(TAG, "Radio runtime: %s", diagnostic.c_str());
-        if (!this->diag_topic_.empty() && mqtt::global_mqtt_client != nullptr &&
-            mqtt::global_mqtt_client->is_connected()) {
-          mqtt::global_mqtt_client->publish(this->diag_topic_ + "/radio_runtime", diagnostic, 1, false);
+        if (!this->diag_topic_.empty() && mqtt_client() != nullptr &&
+            mqtt_client()->is_connected()) {
+          mqtt_client()->publish(this->diag_topic_ + "/radio_runtime", diagnostic, 1, false);
         }
         if (!this->probe_baseline_reported_) {
           const auto baseline = this->radio->probe_baseline_json();
@@ -492,9 +551,9 @@ void Radio::loop() {
             // undocumented register values, which is bench reading.
             if (this->diag_verbose_)
               ESP_LOGI(TAG, "Register probe baseline (pre-RX, read-only): %s", baseline.c_str());
-            if (!this->diag_topic_.empty() && mqtt::global_mqtt_client != nullptr &&
-                mqtt::global_mqtt_client->is_connected()) {
-              mqtt::global_mqtt_client->publish(this->diag_topic_ + "/probe_baseline", baseline, 1, false);
+            if (!this->diag_topic_.empty() && mqtt_client() != nullptr &&
+                mqtt_client()->is_connected()) {
+              mqtt_client()->publish(this->diag_topic_ + "/probe_baseline", baseline, 1, false);
             }
             // Marked reported whether or not MQTT took it. It used to be set
             // only inside the publish branch, so with the broker away the
@@ -506,8 +565,8 @@ void Radio::loop() {
     }
     RadioTransceiver::RawRxSample raw_sample{};
     while (this->radio->take_raw_rx_sample(raw_sample)) {
-      if (!this->diag_verbose_ || this->diag_topic_.empty() || mqtt::global_mqtt_client == nullptr ||
-          !mqtt::global_mqtt_client->is_connected()) continue;
+      if (!this->diag_verbose_ || this->diag_topic_.empty() || mqtt_client() == nullptr ||
+          !mqtt_client()->is_connected()) continue;
       char hex[511];
       for (size_t i = 0; i < raw_sample.length; ++i)
         snprintf(hex + i * 2, 3, "%02X", (unsigned) raw_sample.bytes[i]);
@@ -528,7 +587,7 @@ void Radio::loop() {
         (unsigned) raw_sample.differing_bytes, (unsigned) raw_sample.first_difference,
         (unsigned) raw_sample.probe[0], (unsigned) raw_sample.probe[1],
         (unsigned) raw_sample.probe[2], (unsigned) raw_sample.probe[3], hex);
-      mqtt::global_mqtt_client->publish(this->diag_topic_ + "/lr_fifo/" +
+      mqtt_client()->publish(this->diag_topic_ + "/lr_fifo/" +
         std::to_string((this->lr_raw_sample_seq_ - 1) % 8), std::string(body), 1, false);
     }
     if (strcmp(this->radio->get_name(), "LR1121") == 0 &&
@@ -537,11 +596,11 @@ void Radio::loop() {
       this->publish_lr_pipeline_diag_(nullptr, false);
       const auto sync_probe = this->radio->sync_probe_json();
       if (!sync_probe.empty() && this->diag_publish_summary_ && !this->diag_topic_.empty() &&
-          mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
-        mqtt::global_mqtt_client->publish(this->diag_topic_ + "/sync_probe", sync_probe, 1, false);
+          mqtt_client() != nullptr && mqtt_client()->is_connected()) {
+        mqtt_client()->publish(this->diag_topic_ + "/sync_probe", sync_probe, 1, false);
         const auto drain_sample = this->radio->drain_sample_json();
         if (!drain_sample.empty())
-          mqtt::global_mqtt_client->publish(this->diag_topic_ + "/lr_drain", drain_sample, 1, false);
+          mqtt_client()->publish(this->diag_topic_ + "/lr_drain", drain_sample, 1, false);
       }
     }
   }
@@ -751,7 +810,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
   }
 }
 
-  auto *mqtt = mqtt::global_mqtt_client;
+  auto *mqtt = mqtt_client();
   if (this->radio != nullptr && mqtt != nullptr && mqtt->is_connected() && !this->diag_topic_.empty()) {
     std::string boot_payload = str_sprintf(
         "{\"event\":\"boot\",\"radio\":\"%s\",\"listen_mode\":\"%s\",\"uptime_ms\":%lu}",
@@ -768,7 +827,11 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
       mqtt->publish(this->diag_topic_, std::string(boot_payload), this->diag_qos_, false);
       this->boot_info_event_pending_ = false;
     }
+  }
 
+  // Configuration report and settings: also with diagnostic_mode off, on
+  // <topic_base>/diag/..., so the add-on can show and switch the board.
+  if (this->radio != nullptr && mqtt != nullptr && mqtt->is_connected() && !this->topic_base_().empty()) {
     // Effective configuration as one retained JSON snapshot per boot.
     // The add-on renders it as the "what the board is running" panel;
     // publishing here means the marker (default / CHANGED / set) matches
@@ -776,24 +839,8 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
     if (this->config_report_mqtt_pending_ && !this->config_report_.empty()) {
       // Usually sent before the boot log (~10 s after setup), so the stored
       // listen_mode goes into the report here too (idempotent).
-      this->apply_settings_to_config_report_();
-      std::string cfg_payload = "{\"radio\":\"";
-      cfg_payload += (this->radio != nullptr) ? this->radio->get_name() : "unknown";
-      cfg_payload += "\",\"lines\":[";
-      bool cfg_first = true;
-      for (const auto &cfg_line : this->config_report_) {
-        if (!cfg_first) cfg_payload += ",";
-        cfg_first = false;
-        cfg_payload += "\"";
-        for (char ch : cfg_line) {
-          if (ch == '\\' || ch == '\"') cfg_payload += '\\';
-          if (ch == '\n' || ch == '\r' || ch == '\t') { cfg_payload += ' '; continue; }
-          cfg_payload += ch;
-        }
-        cfg_payload += "\"";
-      }
-      cfg_payload += "]}";
-      std::string cfg_topic = this->diag_topic_ + "/config";
+      std::string cfg_payload = this->config_json_();
+      std::string cfg_topic = this->settings_topic_("config");
       mqtt->publish(cfg_topic, cfg_payload, this->diag_qos_, true);
       this->config_report_mqtt_pending_ = false;
     }
@@ -805,6 +852,22 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
       mqtt->subscribe(
           this->topic_base_() + "/set/listen_mode",
           [this](const std::string &, const std::string &payload) { this->on_set_listen_mode_(payload); }, 1);
+      // Radio-specific settings (e.g. SX1262 rx_gain).
+      for (const auto &key : this->radio->runtime_setting_keys()) {
+        mqtt->subscribe(
+            this->topic_base_() + "/set/" + key,
+            [this, key](const std::string &, const std::string &payload) { this->on_set_radio_setting_(key, payload); },
+            1);
+      }
+      // Component-level settings (diagnostic_mode, publish_rssi, ...).
+      std::vector<std::string> keys = {"diagnostic_mode", "publish_rssi"};
+      if (strcmp(this->radio->get_name(), "SX1276") == 0) keys.push_back("sx1276_busy_ether_mode");
+      for (const auto &key : keys) {
+        mqtt->subscribe(
+            this->topic_base_() + "/set/" + key,
+            [this, key](const std::string &, const std::string &payload) { this->on_set_component_setting_(key, payload); },
+            1);
+      }
     }
     if (this->settings_publish_pending_) {
       this->settings_publish_pending_ = false;
@@ -929,7 +992,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
       this->diag_truncated_++;
       this->diag_15m_truncated_++;
       this->diag_60min_truncated_++;
-      if (this->should_publish_packet_event_(p) && mqtt::global_mqtt_client != nullptr && !this->diag_topic_.empty()) {
+      if (this->should_publish_packet_event_(p) && mqtt_client() != nullptr && !this->diag_topic_.empty()) {
         char payload[1280];
         if (this->diag_publish_raw_) {
           snprintf(payload, sizeof(payload),
@@ -951,7 +1014,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
                    (unsigned) p->decoded_len(), (unsigned) p->final_len(),
                    (unsigned) p->dll_crc_removed(), (unsigned) p->suffix_ignored());
         }
-        mqtt::global_mqtt_client->publish(this->diag_topic_, std::string(payload), this->diag_qos_, false);
+        mqtt_client()->publish(this->diag_topic_, std::string(payload), this->diag_qos_, false);
       }
 
       if (this->diag_verbose_) {
@@ -962,7 +1025,8 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
                  (unsigned) p->raw_got_len(), (unsigned) p->decoded_len(),
                  (unsigned) p->final_len(), (int) p->get_rssi(), p->drop_detail().c_str());
         if (this->diag_publish_raw_) {
-          ESP_LOGW(TAG, LOG_TR("TRUNCATED raw(hex)=%s", "Ucieta ramka raw(hex)=%s"), p->raw_hex().c_str());
+          ESP_LOGW(TAG, LOG_TR("TRUNCATED raw(hex)=%s", "Ucieta ramka raw(hex)=%s"),
+                   log_anonymize() ? LOG_TR("(hidden: anonymize on)", "(ukryte: anonimizacja)") : p->raw_hex().c_str());
         }
       }
     } else if (!p->drop_reason().empty()) {
@@ -1016,7 +1080,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
         this->diag_60min_mode_crc_failed_[mode_idx]++;
       }
 
-      if (this->should_publish_packet_event_(p) && mqtt::global_mqtt_client != nullptr && !this->diag_topic_.empty()) {
+      if (this->should_publish_packet_event_(p) && mqtt_client() != nullptr && !this->diag_topic_.empty()) {
         char payload[1280];
         if (this->diag_publish_raw_) {
           snprintf(payload, sizeof(payload),
@@ -1038,7 +1102,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
                    (unsigned) p->decoded_len(), (unsigned) p->final_len(),
                    (unsigned) p->dll_crc_removed(), (unsigned) p->suffix_ignored());
         }
-        mqtt::global_mqtt_client->publish(this->diag_topic_, std::string(payload), this->diag_qos_, false);
+        mqtt_client()->publish(this->diag_topic_, std::string(payload), this->diag_qos_, false);
       }
 
       if (this->diag_verbose_) {
@@ -1049,7 +1113,8 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
                  (unsigned) p->raw_got_len(), (unsigned) p->decoded_len(),
                  (unsigned) p->final_len(), (int) p->get_rssi(), p->drop_detail().c_str());
         if (this->diag_publish_raw_) {
-          ESP_LOGW(TAG, LOG_TR("DROPPED raw(hex)=%s", "Odrzucony pakiet raw(hex)=%s"), p->raw_hex().c_str());
+          ESP_LOGW(TAG, LOG_TR("DROPPED raw(hex)=%s", "Odrzucony pakiet raw(hex)=%s"),
+                   log_anonymize() ? LOG_TR("(hidden: anonymize on)", "(ukryte: anonimizacja)") : p->raw_hex().c_str());
         }
       }
     }
@@ -1253,6 +1318,9 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
   }
 
   const char *log_tag = TAG;
+  // Log text only: id_str itself stays real for MQTT / forwarding below.
+  char log_id_buf[12];
+  const char *log_id = anon_meter_id(id_str, log_id_buf, sizeof(log_id_buf));
   if (highlight) {
     if (!this->highlight_tag_.empty()) log_tag = this->highlight_tag_.c_str();
     const char *ansi_pre = this->highlight_ansi_ ? "\033[1;32m" : "";
@@ -1262,7 +1330,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
              d.size(), p->raw_got_len(), frame->rssi(),
              link_mode_name(frame->link_mode()),
              frame->format().c_str(),
-             mfr, id_str, (unsigned) ver, (unsigned) dev, (unsigned) ci,
+             mfr, log_id, (unsigned) ver, (unsigned) dev, (unsigned) ci,
              ansi_suf);
 
     // Keep highlight_meters lightweight by default: local emphasis plus packet number only.
@@ -1270,10 +1338,10 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
     const auto &stats = this->highlight_meter_stats_[stats_key_ro];
     if (stats.count == 1) {
       ESP_LOGI(log_tag, LOG_TR("%s[id:%s] first packet (packet #1)", "%s[id:%s] pierwszy pakiet (pakiet nr 1)"),
-               this->highlight_prefix_.c_str(), id_str);
+               this->highlight_prefix_.c_str(), log_id);
     } else {
       ESP_LOGI(log_tag, LOG_TR("%s[id:%s] packet #%u received", "%s[id:%s] odebrano pakiet nr %u"),
-               this->highlight_prefix_.c_str(), id_str,
+               this->highlight_prefix_.c_str(), log_id,
                (unsigned) stats.count);
     }
   } else {
@@ -1281,7 +1349,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
              d.size(), p->raw_got_len(), frame->rssi(),
              link_mode_name(frame->link_mode()),
              frame->format().c_str(),
-             mfr, id_str, (unsigned) ver, (unsigned) dev, (unsigned) ci);
+             mfr, log_id, (unsigned) ver, (unsigned) dev, (unsigned) ci);
   }
 
   // Per-frame frequency error, next to the meter that sent it.
@@ -1300,7 +1368,7 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
     if (this->radio->take_frame_freq_error(&afc_hz, &fei_hz)) {
       ESP_LOGI(TAG, "FREQERR id:%s mode:%s len:%zu rssi:%ddBm afc:%ldHz fei:%ldHz"
                     LOG_TR("", " (blad czestotliwosci nadajnika)"),
-               id_str, link_mode_name(frame->link_mode()), d.size(), frame->rssi(),
+               log_id, link_mode_name(frame->link_mode()), d.size(), frame->rssi(),
                (long) afc_hz, (long) fei_hz);
     }
   }
@@ -1323,7 +1391,9 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
 }
 
 void Radio::wakeup_receiver_task_from_isr(TaskHandle_t *arg) {
-  BaseType_t xHigherPriorityTaskWoken;
+  // FreeRTOS only ever sets this to pdTRUE; it must start at pdFALSE, or a
+  // stack leftover asks for a context switch from every interrupt.
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   vTaskNotifyGiveFromISR(*arg, &xHigherPriorityTaskWoken);
   portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
@@ -1350,7 +1420,23 @@ void Radio::receive_frame() {
       this->diag_60min_rx_path_.stale_wakeups_cleared++;
     }
     this->radio->restart_rx();
-    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(hop_ms))) {
+    // Only the opt-in CC1101 bench path slices this wait. Do not clear task
+    // notifications or blindly flush FIFO between slices: a sync IRQ may have
+    // arrived just as the previous wait expired. The driver checks GDO2/FIFO
+    // before any maintenance. The legacy 5-second safety re-arm stays intact.
+    const uint32_t poll_ms = this->radio->idle_rx_poll_interval_ms();
+    uint32_t hop_waited = 0;
+    bool notified = false;
+    while (hop_waited < hop_ms) {
+      const uint32_t slice_ms = poll_ms == 0 ? hop_ms : std::min(poll_ms, hop_ms - hop_waited);
+      if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(slice_ms))) {
+        notified = true;
+        break;
+      }
+      hop_waited += slice_ms;
+      if (poll_ms != 0 && hop_waited < hop_ms) this->radio->service_idle_rx();
+    }
+    if (notified) {
       got_irq = true;
       this->diag_rx_path_.irq_fired++;
       this->diag_15m_rx_path_.irq_fired++;
@@ -1775,6 +1861,11 @@ static const char *listen_mode_key_(ListenMode mode) {
 void Radio::apply_settings_to_config_report_() {
   if (this->config_report_settings_applied_ || this->radio == nullptr) return;
   this->config_report_settings_applied_ = true;
+  // Settings stored by the add-on: the radio's own, then the component's.
+  this->radio->patch_config_report(this->config_report_);
+  this->diag_mode_opt_.patch(this->config_report_);
+  this->publish_rssi_opt_.patch(this->config_report_);
+  if (strcmp(this->radio->get_name(), "SX1276") == 0) this->busy_ether_opt_.patch(this->config_report_);
   if (!this->radio->listen_mode_from_store()) return;
   for (auto &line : this->config_report_) {
     if (line.rfind("  listen_mode: ", 0) == 0) {
@@ -1785,7 +1876,18 @@ void Radio::apply_settings_to_config_report_() {
   }
 }
 
+std::string Radio::settings_topic_(const char *leaf) const {
+  if (!this->diag_topic_.empty()) return this->diag_topic_ + "/" + leaf;
+  return this->topic_base_() + "/diag/" + leaf;
+}
+
 std::string Radio::topic_base_() const {
+  // wmbus/<topic_name>: from the health topic, which exists whatever
+  // diagnostic_mode says; an explicit diagnostic_topic is the fallback.
+  const std::string health = "/health";
+  if (this->health_topic_.size() > health.size() &&
+      this->health_topic_.compare(this->health_topic_.size() - health.size(), health.size(), health) == 0)
+    return this->health_topic_.substr(0, this->health_topic_.size() - health.size());
   const std::string suffix = "/diag";
   if (this->diag_topic_.size() > suffix.size() &&
       this->diag_topic_.compare(this->diag_topic_.size() - suffix.size(), suffix.size(), suffix) == 0)
@@ -1798,21 +1900,185 @@ std::string Radio::topic_base_() const {
 // applied. The add-on draws the board's settings panel from it; a board
 // without this topic runs firmware that cannot take changes.
 void Radio::publish_settings_() {
-  auto *mqtt = mqtt::global_mqtt_client;
-  if (mqtt == nullptr || !mqtt->is_connected() || this->radio == nullptr || this->diag_topic_.empty()) {
+  auto *mqtt = mqtt_client();
+  if (mqtt == nullptr || !mqtt->is_connected() || this->radio == nullptr || this->topic_base_().empty()) {
     this->settings_publish_pending_ = true;
     return;
   }
+  mqtt->publish(this->settings_topic_("settings"), this->settings_json_(), this->diag_qos_, true);
+}
+
+// <diag>/settings payload (also remote_settings_json()).
+std::string Radio::settings_json_() {
   const std::string chip = this->radio->get_name();
-  std::string unsupported = chip == "CC1101" ? "[\"s1\"]" : "[]";
-  std::string weak = chip == "SX1262" ? "[\"s1\"]" : "[]";
+  // S1 on CC1101 has its own modem profile since 2026-11-13 but is still
+  // experimental, so it is offered with a warning like SX1262's weaker S1.
+  std::string unsupported = "[]";
+  std::string weak = (chip == "SX1262" || chip == "CC1101") ? "[\"s1\"]" : "[]";
   std::string payload = "{\"v\":1,\"radio\":\"" + chip + "\",\"listen_mode\":{\"value\":\"" +
                         listen_mode_key_(this->radio->get_listen_mode()) + "\",\"source\":\"" +
                         (this->radio->listen_mode_from_store() ? "stored" : "yaml") + "\",\"yaml\":\"" +
                         listen_mode_key_(this->radio->get_yaml_listen_mode()) +
                         "\",\"options\":[\"t1\",\"c1\",\"both\",\"s1\"],\"unsupported\":" + unsupported +
-                        ",\"weak\":" + weak + ",\"apply\":\"restart\"}}";
-  mqtt->publish(this->diag_topic_ + "/settings", payload, this->diag_qos_, true);
+                        ",\"weak\":" + weak + ",\"apply\":\"restart\"}" +
+                        this->radio->runtime_settings_json() +
+                        // repeater: true - no MQTT, so diagnostic_mode and publish_rssi change
+                        // nothing on this board; do not offer them (the radio settings stay).
+                        (g_repeater_mode ? "" : this->diag_mode_opt_.json() + this->publish_rssi_opt_.json()) +
+                        (chip == "SX1276" ? this->busy_ether_opt_.json() : "") + "}";
+  return payload;
+}
+
+// <diag>/config payload (also remote_config_json()): the effective
+// configuration as the boot log shows it, with the stored settings applied.
+std::string Radio::config_json_() {
+  this->apply_settings_to_config_report_();
+  std::string cfg_payload = "{\"radio\":\"";
+  cfg_payload += (this->radio != nullptr) ? this->radio->get_name() : "unknown";
+  cfg_payload += "\",\"lines\":[";
+  bool cfg_first = true;
+  for (const auto &cfg_line : this->config_report_) {
+    if (!cfg_first) cfg_payload += ",";
+    cfg_first = false;
+    cfg_payload += "\"";
+    for (char ch : cfg_line) {
+      if (ch == '\\' || ch == '\"') cfg_payload += '\\';
+      if (ch == '\n' || ch == '\r' || ch == '\t') { cfg_payload += ' '; continue; }
+      cfg_payload += ch;
+    }
+    cfg_payload += "\"";
+  }
+  cfg_payload += "]}";
+  return cfg_payload;
+}
+
+std::string Radio::remote_config_json() {
+  if (this->config_report_.empty()) return "";
+  return this->config_json_();
+}
+
+std::string Radio::remote_settings_json() {
+  if (this->radio == nullptr) return "";
+  return this->settings_json_();
+}
+
+// Same dispatch as the <topic>/set/<key> subscriptions in loop(): only the keys
+// a board with MQTT would subscribe to.
+void Radio::apply_remote_setting(const std::string &key, const std::string &payload) {
+  if (this->radio == nullptr) return;
+  if (key == "listen_mode") {
+    this->on_set_listen_mode_(payload);
+    return;
+  }
+  for (const auto &k : this->radio->runtime_setting_keys()) {
+    if (k == key) {
+      this->on_set_radio_setting_(key, payload);
+      return;
+    }
+  }
+  if (g_repeater_mode && (key == "diagnostic_mode" || key == "publish_rssi")) {
+    ESP_LOGW(TAG, "remote set/%s: ignored with repeater: true (this board has no MQTT)", key.c_str());
+    return;
+  }
+  if (key == "diagnostic_mode" || key == "publish_rssi" ||
+      (key == "sx1276_busy_ether_mode" && strcmp(this->radio->get_name(), "SX1276") == 0)) {
+    this->on_set_component_setting_(key, payload);
+    return;
+  }
+  ESP_LOGW(TAG, "remote set/%s: unknown setting", key.c_str());
+}
+
+runtime_settings::Option *Radio::component_option_(const std::string &key) {
+  if (key == "diagnostic_mode") return &this->diag_mode_opt_;
+  if (key == "publish_rssi") return &this->publish_rssi_opt_;
+  if (key == "sx1276_busy_ether_mode") return &this->busy_ether_opt_;
+  return nullptr;
+}
+
+void Radio::on_set_component_setting_(const std::string &key, const std::string &payload) {
+  auto *opt = this->component_option_(key);
+  if (opt == nullptr) return;
+  this->finish_setting_(key, payload, opt->set(payload));
+}
+
+// diagnostic_mode presets, the same table as __init__.py (preset_map). A
+// field YAML set explicitly keeps its value; the diag topic follows the mode
+// unless YAML gave diagnostic_topic.
+void Radio::apply_diag_preset_(uint8_t mode) {
+  //                       verbose raw summary drop rx_path hl_only suggest 15min 60min meter_stats
+  static const uint8_t T[5][10] = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0},   // off
+                                   {0, 0, 1, 0, 0, 0, 0, 0, 0, 0},   // low
+                                   {0, 0, 1, 0, 0, 0, 1, 1, 0, 1},   // normal
+                                   {0, 0, 1, 1, 1, 1, 1, 1, 0, 1},   // debug
+                                   {1, 1, 1, 1, 1, 0, 1, 1, 1, 2}};  // dev
+  if (mode > 4) return;
+  const uint8_t *p = T[mode];
+  const uint16_t x = this->diag_explicit_mask_;
+  if (!(x & (1 << 0))) this->diag_verbose_ = p[0];
+  if (!(x & (1 << 1))) this->diag_publish_raw_ = p[1];
+  if (!(x & (1 << 2))) this->diag_publish_summary_ = p[2];
+  if (!(x & (1 << 3))) this->diag_publish_drop_events_ = p[3];
+  if (!(x & (1 << 4))) this->diag_publish_rx_path_events_ = p[4];
+  if (!(x & (1 << 5))) this->diag_publish_highlight_only_ = p[5];
+  if (!(x & (1 << 6))) this->diag_publish_suggestion_ = p[6];
+  if (!(x & (1 << 7))) this->diag_publish_summary_15min_ = p[7];
+  if (!(x & (1 << 8))) this->diag_publish_summary_60min_ = p[8];
+  if (!(x & (1 << 9))) {
+    static const char *const MS[3] = {"off", "highlighted", "all"};
+    this->meter_stats_str_ = MS[p[9]];
+    if (!(x & (1 << 10))) {
+      this->diag_publish_summary_highlight_meters_ = p[9] != 0;
+      this->diag_meter_stats_all_ = p[9] == 2;
+    }
+  }
+  this->diag_mode_str_ = this->diag_mode_opt_.options[mode];
+  if (!this->diag_topic_explicit_) {
+    const bool on = mode != 0 || this->diag_publish_summary_ || this->diag_publish_drop_events_ ||
+                    this->diag_publish_rx_path_events_ || this->diag_publish_summary_15min_ ||
+                    this->diag_publish_summary_60min_ || this->diag_publish_summary_highlight_meters_ ||
+                    this->diag_publish_suggestion_;
+    this->diag_topic_ = on ? this->diag_base_topic_ : "";
+  }
+  ESP_LOGI(TAG, "diagnostic_mode from the add-on's stored setting: %s (YAML: %s)", this->diag_mode_str_.c_str(),
+           this->diag_mode_opt_.options[this->diag_mode_opt_.yaml]);
+}
+
+// <topic>/set/<key> for a radio-specific setting; the radio validates and
+// stores it, the board restarts to apply it like listen_mode.
+void Radio::on_set_radio_setting_(const std::string &key, const std::string &payload) {
+  if (this->radio == nullptr) return;
+  this->finish_setting_(key, payload, this->radio->set_runtime_setting(key, payload));
+}
+
+// Shared tail of every set/<key>: log, report to the add-on, restart on a
+// stored change.
+void Radio::finish_setting_(const std::string &key, const std::string &payload, int r) {
+  auto *mqtt = mqtt_client();
+  const bool can_publish = mqtt != nullptr && mqtt->is_connected() && !this->diag_topic_.empty();
+  if (r == 0) {
+    ESP_LOGW(TAG, "set/%s: invalid value '%s'", key.c_str(), payload.c_str());
+    return;
+  }
+  if (r == 1) {
+    ESP_LOGD(TAG, "set/%s: '%s' already in effect", key.c_str(), payload.c_str());
+    return;
+  }
+  if (r == 3) {
+    ESP_LOGW(TAG, "set/%s: could not store '%s' in flash, not restarting", key.c_str(), payload.c_str());
+    if (can_publish) {
+      mqtt->publish(this->diag_topic_,
+                    "{\"event\":\"setting_failed\",\"key\":\"" + key + "\",\"reason\":\"flash\"}",
+                    this->diag_qos_, false);
+    }
+    return;
+  }
+  ESP_LOGI(TAG, "set/%s: '%s' stored, restarting to apply it", key.c_str(), payload.c_str());
+  if (can_publish) {
+    mqtt->publish(this->diag_topic_,
+                  "{\"event\":\"setting_saved\",\"key\":\"" + key + "\",\"restart\":true}",
+                  this->diag_qos_, false);
+  }
+  this->set_timeout("wmbus_settings_restart", 1000, []() { App.safe_reboot(); });
 }
 
 // <topic>/set/listen_mode: t1 | c1 | both | s1, or "yaml" to drop the stored
@@ -1839,17 +2105,13 @@ void Radio::on_set_listen_mode_(const std::string &raw) {
   if (code != runtime_settings::NONE && code == (uint8_t) this->radio->get_yaml_listen_mode()) {
     code = runtime_settings::NONE;
   }
-  if (code == LISTEN_MODE_S1 && std::string(this->radio->get_name()) == "CC1101") {
-    ESP_LOGW(TAG, "set/listen_mode: S1 is not supported on CC1101, ignored");
-    return;
-  }
   const uint8_t stored = runtime_settings::load_listen_mode();
   const uint8_t effective_after = code == runtime_settings::NONE ? (uint8_t) this->radio->get_yaml_listen_mode() : code;
   if (stored == code && (uint8_t) this->radio->get_listen_mode() == effective_after) {
     ESP_LOGD(TAG, "set/listen_mode: '%s' already in effect", v.c_str());
     return;
   }
-  auto *mqtt = mqtt::global_mqtt_client;
+  auto *mqtt = mqtt_client();
   if (!runtime_settings::save_listen_mode(code)) {
     // No restart: it would come back with the old mode and look like a
     // silent no-op. The add-on shows the event instead.

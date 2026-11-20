@@ -23,7 +23,10 @@ _LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@SzczepanLeon", "@kubasaw", "@Kustonium"]
 
-DEPENDENCIES = ["esp32", "spi", "mqtt"]
+# mqtt is NOT a hard dependency any more: repeater: true builds a radio front
+# end without an mqtt: block (frames leave through on_frame, e.g. ESP-NOW).
+# Every other config still needs mqtt:, enforced in _validate_mqtt_present.
+DEPENDENCIES = ["esp32", "spi"]
 
 # Single public component only.
 # Everything needed by the raw-only bridge lives inside wmbus_radio, so the user
@@ -62,6 +65,7 @@ CONF_PUBLISH_RADIO_RAW = "publish_radio_raw"
 CONF_RADIO_RAW_TOPIC = "radio_raw_topic"
 CONF_PUBLISH_RSSI = "publish_rssi"
 CONF_FORWARD_METERS = "forward_meters"
+CONF_REPEATER = "repeater"
 
 # Per-topic MQTT QoS (0/1/2). Every default below matches the value that was
 # previously hardcoded, so an existing YAML with none of these set keeps
@@ -180,10 +184,26 @@ CONF_SX1262_FORCE_LONG_STREAM = "sx1262_force_long_stream"
 #     before, 0.67 day and 0.70 night after). The loss is in strong and middle
 #     frames (-81..-88 dBm on the LilyGO scale: 6% vs 31% at night) and nothing
 #     is gained on the weakest (-93 dBm and below: 5% vs 8%). 0x43 stays.
-#   cc1101_sync_15_16: MDMCFG2 0x06 -> 0x05. 16 of 16 sync bits plus carrier
-#     sense, versus 15 of 16 without it: one wrong sync bit no longer loses a
-#     weak frame. Expect more false starts (no carrier-sense gate).
+#   cc1101_sync_15_16: MDMCFG2 0x06 -> 0x05: 16/16 -> 15/16 sync bits. BOTH
+#     values keep the carrier-sense qualifier (SWRS061I p.44, SYNC_MODE 110 and
+#     101); 15/16 alone does not remove the CS gate.
+#   cc1101_carrier_sense: false clears SYNC_MODE bit 2 (0x06 -> 0x02, 0x05 ->
+#     0x01): sync accepted without carrier sense. TI AN067 puts the link B CS
+#     limit near -104 dBm, below the profile's PER 1 % sensitivity (-96..-97,
+#     Table 14), so no gain is expected unless our CS sits higher; bench test.
+#   cc1101_rx_bandwidth: T1/C1 RX filter 325 (TI AN067 link B, minimum for the
+#     whole tolerance range) / 270 / 232 kHz. Narrower = less noise for typical
+#     meters, worse for extreme frequency offset (AN067 8.2.2). 232 kHz is the
+#     default since 2026-11-16: on the bench (LR1121 on a splitter as the
+#     reference) it caught more frames near the threshold than 325 kHz and lost
+#     nothing on strong ones. YAML only; the add-on switch it had during that
+#     test is gone and a value it stored is dropped at boot.
 CONF_CC1101_SYNC_15_16 = "cc1101_sync_15_16"
+CONF_CC1101_CARRIER_SENSE = "cc1101_carrier_sense"
+CONF_CC1101_RX_BANDWIDTH = "cc1101_rx_bandwidth"
+CC1101_RX_BANDWIDTHS = {"325khz": 0, "270khz": 1, "232khz": 2}
+CONF_CC1101_RX_STATE_WAIT = "cc1101_rx_state_wait"
+CONF_CC1101_IDLE_RX_REFRESH = "cc1101_idle_rx_refresh"
 # Bench option: SX1262 regulator. The driver never sent SetRegulatorMode, so the
 # chip has always run on its reset default, the LDO. RadioLib and Semtech's
 # reference drivers switch to DC-DC at init, and another SX1262 driver that does
@@ -447,6 +467,10 @@ BASE_CONFIG_SCHEMA = (
             cv.Optional(CONF_GDO2_PIN): pins.internal_gpio_input_pin_schema,
             cv.Optional(CONF_CC1101_ALLOW_EXPERIMENTAL, default=False): cv.boolean,
             cv.Optional(CONF_CC1101_SYNC_15_16, default=False): cv.boolean,
+            cv.Optional(CONF_CC1101_CARRIER_SENSE, default=True): cv.boolean,
+            cv.Optional(CONF_CC1101_RX_BANDWIDTH, default="232khz"): cv.one_of(*CC1101_RX_BANDWIDTHS, lower=True),
+            cv.Optional(CONF_CC1101_RX_STATE_WAIT, default=False): cv.boolean,
+            cv.Optional(CONF_CC1101_IDLE_RX_REFRESH, default=False): cv.boolean,
             # SPI clock for the radio device only, not for the whole bus.
             #
             # The driver defaults to 2 MHz, which is well inside every supported
@@ -591,6 +615,11 @@ BASE_CONFIG_SCHEMA = (
             # Publish the measured RSSI of each forwarded meter frame to
             # wmbus/<topic_name>/rssi/<meter_id>. Disabled by default.
             cv.Optional(CONF_PUBLISH_RSSI, default=False): cv.boolean,
+            # Radio front end only: no MQTT at all (no telegram/rx/diag topics,
+            # no outbox, no outage statistics). Frames leave only through
+            # on_frame - e.g. a receiver at the meter that hands them over
+            # ESP-NOW to a bridge board with network. Lets the YAML drop mqtt:.
+            cv.Optional(CONF_REPEATER, default=False): cv.boolean,
             # Whitelist of meter IDs allowed on the RAW telegram topic. Accepts
             # either an explicit list, or `true` to reuse highlight_meters so the
             # same IDs are not written twice. Empty (default) forwards every
@@ -684,7 +713,10 @@ BASE_CONFIG_SCHEMA = (
             # exactly zero on two SX1262 boards and an LR1121).
             cv.Optional(CONF_SX1276_PREAMBLE_TOLERANCE, default=10): cv.int_range(min=0, max=31),
 
-            cv.Optional(CONF_SX1262_RX_BANDWIDTH, default="312khz"): cv.one_of(
+            # 234khz since 2026-11-15: measured better than the inherited
+            # 312khz on three SX1262 boards in `both` (T1 and C1), see
+            # transceiver_sx1262.cpp.
+            cv.Optional(CONF_SX1262_RX_BANDWIDTH, default="234khz"): cv.one_of(
                 *SX1262_T1_RX_BANDWIDTHS, lower=True
             ),
             cv.Optional(CONF_SX1262_TCXO_STARTUP_MS, default=1): cv.int_range(min=1, max=20),
@@ -786,7 +818,9 @@ _REPORT_RADIO = {
                CONF_SX1262_REGULATOR),
     "SX1276": (CONF_SX1276_BUSY_ETHER_MODE, CONF_MIN_PREAMBLE_BITS,
                CONF_SX1276_PREAMBLE_TOLERANCE),
-    "CC1101": (CONF_CC1101_ALLOW_EXPERIMENTAL, CONF_CC1101_SYNC_15_16),
+    "CC1101": (CONF_CC1101_ALLOW_EXPERIMENTAL, CONF_CC1101_SYNC_15_16,
+               CONF_CC1101_CARRIER_SENSE, CONF_CC1101_RX_BANDWIDTH,
+               CONF_CC1101_RX_STATE_WAIT, CONF_CC1101_IDLE_RX_REFRESH),
     "LR1121": (CONF_LR1121_ALLOW_EXPERIMENTAL, CONF_TCXO_VOLTAGE, CONF_TCXO_STARTUP_TICKS,
                CONF_RX_BANDWIDTH, CONF_MIN_PREAMBLE_BITS, CONF_PAYLOAD_LENGTH,
                CONF_RX_BOOSTED, CONF_BITRATE, CONF_DEVIATION,
@@ -794,7 +828,7 @@ _REPORT_RADIO = {
                CONF_LR1121_SYNC_PROBE, CONF_LR1121_DRAIN, CONF_LR1121_AUTO_LENGTH),
 }
 
-_REPORT_OUTPUT = (CONF_TOPIC_NAME, CONF_TELEGRAM_TOPIC, CONF_PUBLISH_RSSI,
+_REPORT_OUTPUT = (CONF_REPEATER, CONF_TOPIC_NAME, CONF_TELEGRAM_TOPIC, CONF_PUBLISH_RSSI,
                   CONF_FORWARD_METERS, CONF_TARGET_METER_ID, CONF_PUBLISH_RADIO_RAW, CONF_RADIO_RAW_TOPIC,
                   CONF_TELEGRAM_QOS, CONF_RSSI_QOS, CONF_HEALTH_QOS, CONF_DIAGNOSTIC_QOS,
                   CONF_RX_QOS, CONF_MQTT_BUFFER_SIZE, CONF_BUFFER_PRIORITY)
@@ -923,7 +957,11 @@ def _validate_radio_pins(config):
             raise cv.Invalid("gdo0_pin/gdo2_pin are only valid for CC1101. Use irq_pin for SX1262/SX1276.")
         if CONF_CC1101_ALLOW_EXPERIMENTAL in config and config.get(CONF_CC1101_ALLOW_EXPERIMENTAL, False):
             raise cv.Invalid("cc1101_allow_experimental is only valid for radio_type: CC1101.")
-        for opt in (CONF_CC1101_SYNC_15_16,):
+        if config.get(CONF_CC1101_CARRIER_SENSE, True) is False:
+            raise cv.Invalid(f"{CONF_CC1101_CARRIER_SENSE} is only valid for radio_type: CC1101.")
+        if config.get(CONF_CC1101_RX_BANDWIDTH, "232khz") != "232khz":
+            raise cv.Invalid(f"{CONF_CC1101_RX_BANDWIDTH} is only valid for radio_type: CC1101.")
+        for opt in (CONF_CC1101_SYNC_15_16, CONF_CC1101_RX_STATE_WAIT, CONF_CC1101_IDLE_RX_REFRESH):
             if config.get(opt, False):
                 raise cv.Invalid(f"{opt} is only valid for radio_type: CC1101.")
 
@@ -1097,10 +1135,27 @@ def _validate_log_language_consistent(config):
     return config
 
 
+def _validate_mqtt_present(config):
+    # Since repeater: true exists, mqtt is no longer in DEPENDENCIES - so the
+    # "you forgot mqtt:" error ESPHome used to give for free has to be given
+    # here, for every instance that actually publishes.
+    full = fv.full_config.get()
+    if "mqtt" in full:
+        return config
+    for c in full.get("wmbus_radio", []):
+        if isinstance(c, dict) and not c.get(CONF_REPEATER, False):
+            raise cv.Invalid(
+                "wmbus_radio needs an mqtt: block (or repeater: true for a board that only "
+                "passes frames on through on_frame) / wmbus_radio wymaga sekcji mqtt: "
+                "(albo repeater: true dla plytki, ktora tylko przekazuje ramki przez on_frame)."
+            )
+    return config
+
+
 # Final validation: the target framework is only reliably known once every
 # component has been validated, so this cannot live in CONFIG_SCHEMA. The
 # language check needs every instance, which is also only known here.
-FINAL_VALIDATE_SCHEMA = cv.All(_validate_framework, _validate_log_language_consistent)
+FINAL_VALIDATE_SCHEMA = cv.All(_validate_framework, _validate_log_language_consistent, _validate_mqtt_present)
 
 
 async def to_code(config):
@@ -1147,7 +1202,7 @@ async def to_code(config):
             radio_var.set_t1_rx_bandwidth(
                 getattr(
                     SX1262T1RxBandwidth,
-                    SX1262_T1_RX_BANDWIDTHS[config.get(CONF_SX1262_RX_BANDWIDTH, "312khz")],
+                    SX1262_T1_RX_BANDWIDTHS[config.get(CONF_SX1262_RX_BANDWIDTH, "234khz")],
                 )
             )
         )
@@ -1246,6 +1301,10 @@ async def to_code(config):
         cg.add(radio_var.set_gdo2_pin(gdo2_pin))
         cg.add(radio_var.set_frequency_mhz(frequency_mhz))
         cg.add(radio_var.set_sync_15_16(config[CONF_CC1101_SYNC_15_16]))
+        cg.add(radio_var.set_carrier_sense(config[CONF_CC1101_CARRIER_SENSE]))
+        cg.add(radio_var.set_rx_bandwidth(CC1101_RX_BANDWIDTHS[config[CONF_CC1101_RX_BANDWIDTH]]))
+        cg.add(radio_var.set_rx_state_wait(config[CONF_CC1101_RX_STATE_WAIT]))
+        cg.add(radio_var.set_idle_rx_refresh(config[CONF_CC1101_IDLE_RX_REFRESH]))
         # Receiver task wake-up interrupt is the sync-detect line.
         cg.add(radio_var.set_irq_pin(gdo2_pin))
     else:
@@ -1388,6 +1447,7 @@ async def to_code(config):
     if CONF_RADIO_RAW_TOPIC in config:
         cg.add(var.set_radio_raw_topic(config[CONF_RADIO_RAW_TOPIC]))
     cg.add(var.set_publish_rssi(config.get(CONF_PUBLISH_RSSI, False)))
+    cg.add(var.set_repeater(config[CONF_REPEATER]))
 
     cg.add(var.set_telegram_qos(config[CONF_TELEGRAM_QOS]))
     cg.add(var.set_rssi_qos(config[CONF_RSSI_QOS]))
@@ -1471,6 +1531,26 @@ async def to_code(config):
     cg.add(var.set_diag_publish_summary_60min(config[CONF_DIAG_PUBLISH_SUMMARY_60MIN] if CONF_DIAG_PUBLISH_SUMMARY_60MIN in config else diag_preset["summary_60min"]))
     cg.add(var.set_diag_publish_summary_highlight_meters(summary_highlight))
     cg.add(var.set_diag_meter_stats_all(meter_stats_all))
+    # diagnostic_mode can also be switched from the add-on (runtime_settings.h);
+    # the board then applies the preset itself. Fields YAML set explicitly keep
+    # their value there too: one bit each, in the order of
+    # Radio::apply_diag_preset_().
+    diag_explicit = (
+        CONF_DIAG_VERBOSE in config,
+        CONF_DIAG_PUBLISH_RAW in config,
+        CONF_DIAG_PUBLISH_SUMMARY in config,
+        CONF_DIAG_PUBLISH_DROP_EVENTS in config,
+        CONF_DIAG_PUBLISH_RX_PATH_EVENTS in config,
+        CONF_DIAG_EVENTS_HIGHLIGHT_ONLY in config or CONF_DIAG_PUBLISH_HIGHLIGHT_ONLY in config,
+        CONF_DIAG_PUBLISH_SUGGESTION in config,
+        CONF_DIAG_PUBLISH_SUMMARY_15MIN in config,
+        CONF_DIAG_PUBLISH_SUMMARY_60MIN in config,
+        CONF_DIAG_METER_STATS in config,
+        CONF_DIAG_PUBLISH_SUMMARY_HIGHLIGHT_METERS in config,
+    )
+    cg.add(var.set_diag_explicit_mask(sum(1 << i for i, on in enumerate(diag_explicit) if on)))
+    cg.add(var.set_diag_base_topic(f"wmbus/{topic_name}/diag"))
+    cg.add(var.set_diag_topic_explicit(CONF_DIAG_TOPIC in config and bool(str(config.get(CONF_DIAG_TOPIC, "")).strip())))
 
     for warning in warnings:
         cg.add(var.add_config_warning(warning))

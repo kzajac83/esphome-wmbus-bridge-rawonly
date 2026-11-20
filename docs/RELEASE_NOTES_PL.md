@@ -2,6 +2,94 @@
 
 [English version](RELEASE_NOTES.md)
 
+## SX1262 w `c1`/`both` kończy każde przechwycenie na długości ramki; most przedłużacza publikuje z QoS 1
+
+- **SX1262 z `long_gfsk_packets: true` w `c1` lub `both`:** ścieżka strumieniowa dla długich ramek przycinała przechwycenie do długości ramki tylko w `t1` i `s1`. W `c1`/`both` każde przechwycenie szło do limitu 512 bajtów, przez co tryb długich ramek był włączony na stałe, a odbiornik przy każdej ramce był zajęty przez cały limit. Teraz przechwycenie kończy się razem z ramką (C1 i T1 rozróżnia pierwszy bajt, tak jak robił już LR1121); przechwycenie, z którego nie da się odczytać długości, nadal idzie do limitu jak dotąd. Odczytów SPI jest ok. 60 % mniej, odbiór u zgłaszającego bez zmian. Znalazł, poprawił i przetestował **[@hackbaellchen](https://github.com/hackbaellchen)** ([zgłoszenie #45](https://github.com/Kustonium/esphome-wmbus-bridge-rawonly/issues/45)), razem z testem hosta długości. Przy `long_gfsk_packets: false` (domyślnie) nic się nie zmienia.
+- **Most przedłużacza ESP-NOW publikuje ramki z QoS 1.** Przy QoS 0 ramka liczyła się jako opublikowana, gdy przyjął ją klient MQTT, więc gdy łącze Wi-Fi/MQTT mostu po cichu padło, ramki z następnych ok. 20 s przepadały, choć płytka zdążyła je już usunąć z bufora (stanowisko: 63 z 22 171 ramek w 9 krótkich zerwaniach; samo ESP-NOW nie zgubiło żadnej). Teraz klient MQTT trzyma każdą ramkę do potwierdzenia przez broker. **Wgraj tylko most**; płytka bez zmian. Rzadki duplikat dodatek pokaże jako ramkę poza kolejnością, a nie brakującą.
+
+---
+
+## `forward_meters` można podmienić w trakcie pracy własną lambdą
+
+- **Nowe `set_forward_meters("id1,id2,...")`** - pomysł i implementacja to praca **Alexandra Streita** ([@probutus](https://github.com/probutus), [PR #40](https://github.com/Kustonium/esphome-wmbus-bridge-rawonly/pull/40)); w tym wydaniu dodano tylko zgłaszanie zmiany w `<diag>/config`. Dla kilku płytek zasilanych jedną listą liczników z wmbusmeters: podłączasz to sam, np. `mqtt: on_message:` z `id(radio).set_forward_meters(x);`. Pusty tekst przepuszcza każdą ramkę. Komponent celowo nie ma do tego tematu ani opcji; nic się nie zmienia, dopóki nie napiszesz lambdy.
+- Zmiana trafia do logu, a `<diag>/config` jest publikowane ponownie z `forward_meters: … (CHANGED at runtime; YAML: …)`, więc płytka filtrowana w ten sposób nigdy nie filtruje po cichu. Ta sama lista przysłana ponownie (wiadomość retained po ponownym połączeniu) nic nie robi.
+
+---
+
+## Przedłużacz ESP-NOW (w trakcie): dodatek widzi płytkę jak zwykłą
+
+- **Jeśli używasz przykładu z 1.36:** dopisz do `secrets.yaml` `repeater_web_username` i `repeater_web_password`, zbuduj most w ESPHome 2026.11 lub nowszym i wgraj obie płytki, najpierw most. Po tej aktualizacji strona płytki pyta o logowanie; bez tego hasła płytkę zaktualizujesz już tylko przez USB.
+- **Puls przez most.** Czas pracy, liczba ramek, RSSI, układ i tryb nasłuchu płytki trafiają do dodatku jako `wmbus/<płytka>/health` z `"via":"espnow"`: płytka jest widoczna jako żywa, a jej kafelek ma napis „za mostem ESP-NOW <most> · łącze -70 dBm” zamiast „starszy firmware”.
+- **Konfiguracja i ustawienia przez most.** Opis konfiguracji i ustawienia radia płytki są widoczne w dodatku; tryb nasłuchu, wzmocnienie RX i długie ramki można tam zmieniać (płytka zapisuje ustawienie i się restartuje, jak płytka z MQTT). Przy `repeater: true` nie są oferowane `diagnostic_mode` i `publish_rssi`, bo taka płytka nie ma MQTT. W komponencie: `remote_config_json()`, `remote_settings_json()`, `apply_remote_setting()`.
+- **Pełne ramki wM-Bus.** Most korzysta z ESP-NOW v2 (`espnow: max_payload_size: 300`), więc mieszczą się ramki do 256 B; wcześniej ramki dłuższe niż 239 B przepadały. Stan płytki pokazuje limit („ramki do 289 B”); przy starszym moście płytka liczy dłuższą ramkę jako utraconą, zamiast blokować bufor.
+- **Logowanie na stronie płytki.** Uwierzytelnianie digest chroni stronę i wgrywanie wsadu; README przykładu ma sekcję o bezpieczeństwie.
+
+---
+
+## Dokumentacja: nowa ocena odbiorników po pomiarach na wspólnej antenie i czystym S1
+
+- **S1:** na czystym sygnale (stanowisko tłumikowe, 17.11.2026) `LR1121`, `SX1276` i `SX1262` mieszczą się w ok. 1 dB; `CC1101` o ok. 5 dB słabszy; jeden egzemplarz XIAO o 8 dB słabszy. Zasada z 08.2026 „`SX1276` do S1, `SX1262` do T1” (oparta na RSSI z różnych płytek) jest wycofana; na prawdziwych licznikach przewaga `SX1276` wynika z tolerancji błędu detektora preambuły oraz z anteny i miejsca. Tabela i metoda w CHIP_SELECTION i BENCHMARKS.
+- **`LR1121`:** „wypadł ostatni” jest wycofane - tamto porównanie miało gorsze miejsce anteny. Na jednej antenie przez rozgałęźnik usłyszał najwięcej liczników. Wynik ze stanowiska T1 (SX1262 ok. 4–5 dB dalej) i brak tolerancji na odchyłkę szybkości zostają.
+- Do CHIP_SELECTION doszły antena (10 cm zamiast 6 cm: Heltec +5 dB, XIAO +3 dB) i domyślne 234 kHz na SX1262.
+
+---
+
+## Zgodność z ESPHome 2026.11
+
+- **Poprawka kompilacji:** ESPHome 2026.11 przeniósł `str_sprintf()` / `format_hex()` do `alloc_helpers.h`, którego `helpers.h` już nie dołącza, więc komponent kończył się błędem `'str_sprintf' was not declared` / `'format_hex' was not declared`. Poprawione; starsze wersje ESPHome dalej się kompilują.
+- **MQTT: usuń `skip_cert_cn_check: true` ze swojego YAML.** Od ESPHome 2026.11 ta opcja włącza TLS, więc płytka na zwykłym brokerze (port 1883) nigdy się nie łączy (`mbedtls_ssl_handshake returned -0x7280`). Przed 2026.11 bez certyfikatu nic nie robiła. Wszystkie przykłady są poprawione.
+
+---
+
+## Przykład: przedłużacz ESP-NOW dla odbiornika bez sieci domowej (w trakcie)
+
+- **Status: w trakcie.** Sprawdzone na jednej parze na stanowisku (odbiornik Heltec V4 + most ESP32-C3). Pozostałe pliki płytek są tylko sprawdzone kompilacją w CI; testy zasięgu dopiero przed nami.
+- **Nowy [examples/repeater-espnow](../examples/repeater-espnow/README_PL.md).** Odbiornik przy licznikach, poza zasięgiem Wi-Fi, przekazuje każdą ramkę przez ESP-NOW do płytki-mostu w sieci domowej, a most publikuje ją do MQTT jako ten odbiornik. Pliki płytki dla każdej płytki z przykładów, jeden plik mostu dla dowolnego ESP32. Parowanie samo znajduje kanał; płytka trzyma ramki w buforze (1500 w PSRAM), dopóki most nie potwierdzi, że trafiły do MQTT; numeracja i `received_at` zgodne z `wmbus_radio`, więc dodatek widzi zwykłą płytkę. Korzysta z `repeater: true`.
+
+---
+
+## Ukrywanie numerów liczników na zrzutach
+
+- **Nowe: `esphome::wmbus_radio::set_log_anonymize(true/false)`**, do przełącznika na stronie płytki. Gdy włączone, każdy numer licznika w logu zastępuje numer zastępczy (cyfra plus cyfra dzisiejszej daty UTC, modulo 10), surowy hex uciętych i odrzuconych pakietów jest ukryty, a MQTT, dodatek i `on_frame` dostają prawdziwe numery. Bez zegara numery pokazują się jako `????????`. Zasłona na zrzuty na forum, nie szyfrowanie. Szczegóły: [DIAGNOSTIC](DIAGNOSTIC_PL.md#ukrywanie-numerów-liczników-na-zrzutach).
+
+---
+
+## `repeater: true`, cichy log przy wyłączonym buforze MQTT, poprawka opisu `mark_as_handled`
+
+- **Nowa opcja `repeater` (domyślnie `false`).** Przy `repeater: true` płytka jest tylko odbiornikiem radiowym: bez MQTT w ogóle, czyli bez tematów telegramów, `/rx`, diagnostyki i ustawień, bez bufora i bez statystyk awarii. Ramki wychodzą wyłącznie przez `on_frame`, na przykład przez ESP-NOW do płytki-mostu, która ma sieć i je publikuje. YAML takiej płytki może nie mieć `mqtt:`. Każda inna płytka nadal potrzebuje `mqtt:` i walidacja o tym mówi.
+- **`mqtt_buffer_size: 0` nie zasypuje już logu statystykami bufora.** Bez bufora linie „Statystyki bufora MQTT” co 30 s i lista odrzuconych wg licznika pokazywały każdą ramkę z czasu przerwy brokera jako „eksmisję” z bufora 0/0, a na płytce z wyłączonym MQTT rosły bez końca. Teraz po powrocie brokera pojawia się jedna linia: `MQTT wrocil po N s - M ramek nieopublikowanych (mqtt_buffer_size: 0)`. Z ustawionym buforem nic się nie zmienia.
+- **Poprawka dokumentacji: `mark_as_handled` nie wyłącza publikacji MQTT.** Publikacja odbywa się przed triggerami `on_frame`, a `mark_as_handled` tylko liczy ramkę jako obsłużoną w logu. Dokumentacja twierdziła inaczej. Do wyłączenia publikacji służy `repeater: true` albo `forward_meters`.
+
+---
+
+## Więcej ustawień przełączanych z dodatku, także przy wyłączonej diagnostyce
+
+- **Ustawienia płytki i raport konfiguracji nie wymagają już `diagnostic_mode`.** `diag/settings` i `diag/config` są publikowane, a `set/...` nasłuchiwane, przy każdym `diagnostic_mode`, także `off` (domyślnym). Wcześniej płytki z wyłączoną diagnostyką w ogóle nie dało się przełączać z dodatku, nawet trybu nasłuchu.
+- **Nowe ustawienia przełączane** obok `listen_mode`: `diagnostic_mode` (`off`, `low`, `normal`, `debug`; `dev` zostaje wyborem w YAML), `publish_rssi`, a na SX1262 `rx_gain` i `long_gfsk_packets`, na SX1276 `sx1276_busy_ether_mode`. Każde działa jak tryb nasłuchu: zapis we flashu, zastosowanie po restarcie, `yaml` („wróć do YAML” w dodatku) je kasuje. Pola diagnostyki ustawione wprost w YAML zachowują swoją wartość przy przełączonym `diagnostic_mode`.
+
+---
+
+## CC1101: filtr odbiornika 232 kHz domyślnie, przełączniki testowe znikają z kafelka dodatku
+
+- **`cc1101_rx_bandwidth` ma teraz domyślnie `232khz` zamiast `325khz`.** Zmierzone na stanowisku w listopadzie 2026, odniesieniem LR1121 na rozgałęźniku: więcej ramek przy progu, żaden licznik nie zniknął, żadnych strat na mocnych ramkach. `325khz` (TI AN067) zostaje do wyboru dla liczników ze skrajnym przesunięciem częstotliwości.
+- **Kafelek CC1101 w dodatku nie przełącza już filtra ani wykrywania nośnej.** Oba były przełącznikami testowymi, oba testy są rozstrzygnięte (232 kHz, nośna włączona). Teraz to opcje tylko w YAML. Wartość zapisaną w płytce z dodatku w czasie testów płytka kasuje przy najbliższym starcie i odnotowuje to w logu.
+- **Płytki z `cc1101_rx_bandwidth:` w YAML zachowują swoją wartość.** Płytki bez tego wpisu przechodzą na 232 kHz przy najbliższym budowaniu.
+
+---
+
+## SX1262: filtr odbiornika 234 kHz domyślnie
+
+- **`sx1262_rx_bandwidth` ma teraz domyślnie `234khz` zamiast `312khz`.** Wartość 312 kHz była odziedziczona i nigdy nie zmierzona dla T1. Pomiar 12–13.11.2026, te same godziny w dwa dni robocze, odniesieniem LR1121 na rozgałęźniku: T-Beam na drugim wyjściu rozgałęźnika złapał przy 234 kHz 52,5% ramek LR1121 z zakresu −110..−105 dBm wobec 30,6% przy 312 kHz i słyszał 0,84 jego liczników wobec 0,76. Heltec zyskał przy −105..−100 dBm (33% wobec 26%), XIAO trochę. Mocne ramki nic nie straciły, a C1 w `listen_mode: both` też się poprawił (T-Beam złapał 77% ramek C1 LR1121 wobec 60%).
+- **Płytki z `sx1262_rx_bandwidth:` w YAML zachowują swoją wartość.** Płytki bez tego wpisu przechodzą na 234 kHz przy najbliższym budowaniu. Żeby zostać przy starym zachowaniu, ustaw `sx1262_rx_bandwidth: 312khz`. S1 bez zmian (jego 234,3 kHz było zawsze stałe).
+
+---
+
+## CC1101: opcjonalne testy restartowania RX
+
+- Nowe przełączniki `cc1101_rx_state_wait` i `cc1101_idle_rx_refresh`, oba domyślnie wyłączone. Osobno testują restart potwierdzany MARCSTATE i odświeżanie bezczynnego RX co około 50 ms; nie zmieniają `cc1101_sync_15_16`.
+- Raporty konfiguracji/statusu pokazują ustawienia oraz liczniki prób odświeżenia i timeoutów. Testy hostowe obejmują zmiany stanu, timeouty i nadejście ramki podczas kontroli; wynik RF wymaga pomiaru.
+- Procedura A–B–A i ograniczenia: [testy CC1101 RX](CC1101_RX_BENCH_PL.md).
+
 ## Tryb nasłuchu przełączany z dodatku Home Assistant, bez kompilacji
 
 - **Płytka publikuje teraz ustawienia, które dodatek może zmieniać** (retained `wmbus/<płytka>/diag/settings`), i słucha `wmbus/<płytka>/set/listen_mode` (`t1`, `c1`, `both`, `s1` albo `yaml`). Zakładka Płytki w dodatku (od 1.6.18) pokazuje kafelek każdej płytki z tymi przyciskami. Kliknięcie zapisuje tryb we flashu płytki i ją restartuje (około 10 s); płytka wraca w nowym trybie. S1 na CC1101 jest odrzucane.

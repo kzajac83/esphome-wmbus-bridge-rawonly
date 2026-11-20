@@ -2,6 +2,94 @@
 
 [Polska wersja](RELEASE_NOTES_PL.md)
 
+## SX1262 in `c1`/`both` stops every capture at the frame's length; the repeater bridge publishes with QoS 1
+
+- **SX1262 with `long_gfsk_packets: true` in `c1` or `both`:** the long-frame stream path cut a capture at the frame's length only in `t1` and `s1`. In `c1`/`both` every capture ran to the 512-byte limit, which kept the long-frame mode on for good and held the receiver for the whole limit on every frame. Now the capture ends with the frame (C1 or T1 told apart by the first byte, as the LR1121 already did); a capture whose length cannot be read still runs to the limit as before. SPI reads drop by about 60 %, reception stays the same on the reporter's site. Found, fixed and tested by **[@hackbaellchen](https://github.com/hackbaellchen)** ([issue #45](https://github.com/Kustonium/esphome-wmbus-bridge-rawonly/issues/45)), including a host test of the lengths. With `long_gfsk_packets: false` (the default) nothing changes.
+- **ESP-NOW repeater bridge publishes frames with QoS 1.** With QoS 0 a frame counted as published once the MQTT client took it, so when the bridge's Wi-Fi/MQTT link dropped silently, frames from the next ~20 s were lost although the node had already removed them from its buffer (bench: 63 of 22 171 frames in 9 short drops; ESP-NOW itself lost none). Now the MQTT client keeps each frame until the broker acknowledges it. **Flash only the bridge**; the node is unchanged. A rare duplicate shows in the add-on as out of order, not missing.
+
+---
+
+## `forward_meters` can be replaced at runtime from your own lambda
+
+- **New `set_forward_meters("id1,id2,...")`** - the idea and the implementation are the work of **Alexander Streit** ([@probutus](https://github.com/probutus), [PR #40](https://github.com/Kustonium/esphome-wmbus-bridge-rawonly/pull/40)); this release adds only the `<diag>/config` report of the change. For several boards fed from one meter list kept in wmbusmeters: wire it yourself, e.g. `mqtt: on_message:` with `id(radio).set_forward_meters(x);`. An empty string forwards every frame. The component has no topic or option for this on purpose; nothing changes unless you write the lambda.
+- The change is logged, and `<diag>/config` is published again with `forward_meters: … (CHANGED at runtime; YAML: …)`, so a board filtered this way is never filtered silently. The same list arriving again (a retained message after a reconnect) does nothing.
+
+---
+
+## ESP-NOW repeater (in progress): the add-on sees the node like a board
+
+- **If you use the example from 1.36:** add `repeater_web_username` and `repeater_web_password` to `secrets.yaml`, build the bridge with ESPHome 2026.11 or newer, and flash both boards, the bridge first. After this update the node page asks for its login; without that password the node can only be updated over USB.
+- **Health pulse through the bridge.** The node's uptime, frame count, RSSI, chip and listen mode reach the add-on as `wmbus/<node>/health` with `"via":"espnow"`: the node shows as alive, and its tile reads "behind ESP-NOW bridge <bridge> · link -70 dBm" instead of "older firmware".
+- **Configuration and settings through the bridge.** The node's configuration report and radio settings appear in the add-on; listen mode, RX gain and long packets can be changed there (the node stores the setting and restarts, as a board with MQTT does). `diagnostic_mode` and `publish_rssi` are not offered with `repeater: true`, since such a board has no MQTT. In the component: `remote_config_json()`, `remote_settings_json()`, `apply_remote_setting()`.
+- **Full wM-Bus frames.** The bridge uses ESP-NOW v2 (`espnow: max_payload_size: 300`), so frames up to 256 B fit; before, frames over 239 B were dropped. The node status shows the limit ("frames up to 289 B"); with an older bridge the node counts a longer frame as lost instead of blocking its buffer.
+- **Login on the node page.** Digest authentication guards the page and the firmware upload; the example README has a Security section.
+
+---
+
+## Docs: receivers re-ranked after the shared-antenna and clean-S1 measurements
+
+- **S1:** on a clean signal (attenuator bench, 2026-11-17) `LR1121`, `SX1276` and `SX1262` are within about 1 dB; `CC1101` about 5 dB weaker; one XIAO sample 8 dB weaker. The 2026-08 rule "`SX1276` for S1, `SX1262` for T1" (based on RSSI across boards) is withdrawn; on real meters the `SX1276` lead comes from its preamble error tolerance and from antenna/position. Table and method in CHIP_SELECTION and BENCHMARKS.
+- **`LR1121`:** "came last" is withdrawn - that comparison had a worse antenna position. On one antenna through a splitter it heard the most meters. The T1 attenuator result (SX1262 about 4–5 dB further) and the missing off-rate tolerance stay.
+- Antenna (10 cm instead of 6 cm: Heltec +5 dB, XIAO +3 dB) and the 234 kHz SX1262 default added to CHIP_SELECTION.
+
+---
+
+## ESPHome 2026.11 compatibility
+
+- **Build fix:** ESPHome 2026.11 moved `str_sprintf()` / `format_hex()` to `alloc_helpers.h`, which `helpers.h` no longer includes, so the component failed with `'str_sprintf' was not declared` / `'format_hex' was not declared`. Fixed; older ESPHome releases still build.
+- **MQTT: remove `skip_cert_cn_check: true` from your YAML.** Since ESPHome 2026.11 this option turns TLS on, so a board on a plain broker (port 1883) never connects (`mbedtls_ssl_handshake returned -0x7280`). Before 2026.11 it had no effect without a certificate. All examples are updated.
+
+---
+
+## Example: ESP-NOW repeater for a receiver without the home network (in progress)
+
+- **Status: in progress.** Tested on one bench pair (Heltec V4 receiver + ESP32-C3 bridge). The other node files are build-checked in CI only; range tests are still to come.
+- **New [examples/repeater-espnow](../examples/repeater-espnow/README.md).** A receiver next to the meters, out of Wi-Fi reach, forwards every frame over ESP-NOW to a bridge board on the home network, which publishes it to MQTT as that receiver. Node files for every example board, one bridge file for any ESP32. Pairing finds the channel by itself; the node keeps frames in a buffer (1500 in PSRAM) until the bridge confirms they reached MQTT; numbering and `received_at` follow the `wmbus_radio` contract, so the add-on sees an ordinary board. Uses `repeater: true`.
+
+---
+
+## Hiding meter IDs on screenshots
+
+- **New: `esphome::wmbus_radio::set_log_anonymize(true/false)`**, meant for a template switch on the board's page. While on, every meter ID in the log is replaced by a stand-in (each digit plus the matching digit of today's UTC date, modulo 10), the raw hex of truncated/dropped packets is hidden, and MQTT, the add-on and `on_frame` keep the real IDs. Without a clock IDs show as `????????`. A cover for forum posts, not encryption. See [DIAGNOSTIC](DIAGNOSTIC.md#hiding-meter-ids-on-screenshots).
+
+---
+
+## `repeater: true`, quiet log with the MQTT buffer off, `mark_as_handled` corrected
+
+- **New `repeater` option (default `false`).** With `repeater: true` the board is a radio front end only: no MQTT at all - no telegram, `/rx`, diagnostic or settings topics, no buffer, no outage statistics. Frames leave only through `on_frame`, for example over ESP-NOW to a bridge board that has network and publishes them. The YAML of such a board may omit `mqtt:`. Every other board still needs `mqtt:`, and the validation says so.
+- **`mqtt_buffer_size: 0` no longer fills the log with buffer statistics.** Without a buffer, the 30 s "outbox stats" lines and the per-meter drop list used to report every frame missed during a broker outage as "evicted" from a 0/0 buffer, and they grew without end on a board with MQTT disabled. Now one line is logged when the broker comes back: `MQTT back after N s - M frame(s) not published (mqtt_buffer_size: 0)`. With a buffer set, nothing changes.
+- **Documentation fix: `mark_as_handled` does not stop the MQTT publish.** The publish runs before the `on_frame` triggers; `mark_as_handled` only counts the frame as handled in the log. The docs said otherwise. To stop the publish use `repeater: true` or `forward_meters`.
+
+---
+
+## More settings switchable from the add-on, also with diagnostics off
+
+- **The board's settings and configuration report no longer need `diagnostic_mode`.** `diag/settings` and `diag/config` are published, and `set/...` is listened to, with any `diagnostic_mode`, also `off` (the default). Before, a board with diagnostics off could not be switched from the add-on at all, not even its listen mode.
+- **New switchable settings** besides `listen_mode`: `diagnostic_mode` (`off`, `low`, `normal`, `debug`; `dev` stays a YAML choice), `publish_rssi`, and on SX1262 `rx_gain` and `long_gfsk_packets`, on SX1276 `sx1276_busy_ether_mode`. Each works like the listen mode: stored in flash, applied after a restart, `yaml` (the add-on's "back to YAML") drops it. Diagnostic fields set explicitly in YAML keep their value under a switched `diagnostic_mode`.
+
+---
+
+## CC1101: 232 kHz receive filter by default, bench switches off the add-on tile
+
+- **`cc1101_rx_bandwidth` now defaults to `232khz` instead of `325khz`.** Measured on the bench in November 2026 with an LR1121 on a splitter as the reference: more frames near the threshold, no new meters lost, nothing lost on strong frames. `325khz` (TI AN067) stays selectable for meters with an extreme frequency offset.
+- **The add-on's CC1101 tile no longer switches the RX filter or carrier sense.** Both were test switches; both tests are settled (232 kHz, carrier sense on). They are YAML-only options now. A value the add-on stored on the board during the tests is dropped at the next boot and the log says so.
+- **Boards with `cc1101_rx_bandwidth:` in their YAML keep that value.** Boards without it switch to 232 kHz at the next build.
+
+---
+
+## SX1262: 234 kHz receive filter by default
+
+- **`sx1262_rx_bandwidth` now defaults to `234khz` instead of `312khz`.** The 312 kHz value was inherited and had never been measured for T1. Measured on 2026-11-12/13 at the same hours on two working days, with an LR1121 on a splitter as the reference: a T-Beam on the other splitter output caught 52.5% of the LR1121's frames at -110..-105 dBm with 234 kHz against 30.6% with 312 kHz, and heard 0.84 of its meters against 0.76. A Heltec gained at -105..-100 dBm (33% against 26%), a XIAO a little. Strong frames lost nothing, and C1 in `listen_mode: both` improved as well (the T-Beam caught 77% of the LR1121's C1 frames against 60%).
+- **Boards with `sx1262_rx_bandwidth:` in their YAML keep that value.** Boards without it switch to 234 kHz at the next build. To keep the old behaviour, set `sx1262_rx_bandwidth: 312khz`. S1 is unchanged (its 234.3 kHz was always fixed).
+
+---
+
+## CC1101: opt-in RX restart experiments
+
+- New `cc1101_rx_state_wait` and `cc1101_idle_rx_refresh` switches, both false by default. Test MARCSTATE-confirmed restart separately from guarded 50 ms idle refresh; neither changes `cc1101_sync_15_16`.
+- Effective settings and cumulative refresh/timeout counters appear in configuration/status reports. Host tests cover state transitions, timeouts and packet-arrival guards; RF results remain to be measured.
+- See [CC1101 RX bench](CC1101_RX_BENCH.md) for A-B-A phases and limitations.
+
 ## Listen mode switchable from the Home Assistant add-on, without compiling
 
 - **The board now publishes the settings the add-on may change** (retained `wmbus/<board>/diag/settings`) and listens for `wmbus/<board>/set/listen_mode` (`t1`, `c1`, `both`, `s1` or `yaml`). The add-on's Boards tab (1.6.18 and later) shows a tile per board with these buttons. A click stores the mode in the board's flash and restarts it (about 10 s); the board comes back in the new mode. S1 is refused on CC1101.

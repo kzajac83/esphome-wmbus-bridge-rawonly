@@ -938,6 +938,7 @@ bool SX1262::capture_rx_stream_(uint16_t trigger_irq) {
   uint8_t state_index = 0;  // last read index (wraps 0..255)
   size_t s1_expected_raw_len = 0;
   size_t t1_expected_raw_len = 0;
+  bool ct_len_undecidable = false;  // c1/both: header seen, no length derivable
 
   // Instrumentation for the capture itself, not for its contents.
   //
@@ -1087,6 +1088,41 @@ bool SX1262::capture_rx_stream_(uint16_t trigger_irq) {
           exit_reason = "t1_length";
           break;
         }
+      } else {
+        // listen_mode c1 or both. Until this branch existed, neither mode ever
+        // derived a length here, so every streamed capture ran to buffer_cap
+        // (512 bytes) for exactly the reasons given at expected_raw_len_t1():
+        // RX_DONE cannot fire and the demodulator never falls silent. With
+        // long_gfsk_packets the hold is renewed by any capture >= 250 bytes, and
+        // a 512-byte capture always is - so one long meter in range kept the
+        // stream path on permanently, every C1 frame went through it, and each
+        // capture held the receiver for the full cap instead of the frame.
+        //
+        // Same decision as the LR1121 drain: 0x54 first -> C1 arithmetic,
+        // otherwise T1 (both only).
+        //
+        // Unlike the T1 branch there is deliberately NO early exit when the
+        // header yields no length: such a capture keeps the old behaviour (run
+        // to the cap) so the raw-drain fallback upstream still gets the whole
+        // stream to work with. This keeps the change strictly conservative:
+        // the length is only ever used to cut a capture short, never to
+        // abandon one, so no frame the old path could recover is lost here.
+        const bool allow_t1 = (this->listen_mode_ != LISTEN_MODE_C1);
+        if (t1_expected_raw_len == 0 && !ct_len_undecidable) {
+          t1_expected_raw_len = expected_raw_len_c1_or_t1(this->rx_buffer_, allow_t1);
+          if (t1_expected_raw_len == 0 && raw_len_undecidable_c1_or_t1(this->rx_buffer_, allow_t1)) {
+            ct_len_undecidable = true;
+            ESP_LOGD(TAG, "Stream capture: no length from header %02X %02X %02X, keeping cap %u",
+                     this->rx_buffer_[0], this->rx_buffer_.size() > 1 ? this->rx_buffer_[1] : 0,
+                     this->rx_buffer_.size() > 2 ? this->rx_buffer_[2] : 0, (unsigned) capture_cap);
+          }
+        }
+        if (t1_expected_raw_len != 0 && copied >= t1_expected_raw_len) {
+          this->rx_buffer_.resize(t1_expected_raw_len);
+          copied = t1_expected_raw_len;
+          exit_reason = (this->rx_buffer_[0] == 0x54U) ? "c1_length" : "t1_length";
+          break;
+        }
       }
       // Sparse polling (sx1262_stream_poll_ms): let the frame arrive before the
       // next pointer read instead of reading again at once. The 256-byte ring
@@ -1211,8 +1247,28 @@ bool SX1262::capture_rx_stream_(uint16_t trigger_irq) {
 // Configures FEM pins (if defined), resets the SX1262, and programs all
 // static RF / modulation / packet parameters.
 // ---------------------------------------------------------------------------
+// rx_gain and long_gfsk_packets from the add-on (runtime_settings.h).
+std::vector<std::string> SX1262::runtime_setting_keys() { return {"rx_gain", "long_gfsk_packets"}; }
+
+std::string SX1262::runtime_settings_json() { return this->rx_gain_opt_.json() + this->long_gfsk_opt_.json(); }
+
+int SX1262::set_runtime_setting(const std::string &key, const std::string &value) {
+  if (key == "rx_gain") return this->rx_gain_opt_.set(value);
+  if (key == "long_gfsk_packets") return this->long_gfsk_opt_.set(value);
+  return 0;
+}
+
+void SX1262::patch_config_report(std::vector<std::string> &lines) {
+  this->rx_gain_opt_.patch(lines);
+  this->long_gfsk_opt_.patch(lines);
+}
+
 void SX1262::setup() {
   this->apply_stored_settings_();
+  this->rx_gain_opt_.load();
+  if (this->rx_gain_opt_.stored) this->rx_gain_ = this->rx_gain_opt_.value == 1 ? POWER_SAVING : BOOSTED;
+  this->long_gfsk_opt_.load();
+  if (this->long_gfsk_opt_.stored) this->long_gfsk_packets_ = this->long_gfsk_opt_.value == 1;
   this->irq_edge_ = gpio::INTERRUPT_RISING_EDGE;
   this->common_setup();
   ESP_LOGV(TAG, "Setup");
@@ -1452,9 +1508,17 @@ void SX1262::setup() {
   // S-mode - it is worth about a factor of four and no more. Do not re-run this
   // sweep; the numbers are here.
   // T1 is the one mode the sweep above never covered - it was run on S-mode.
-  // 312.0 kHz here is inherited, not measured, and it is 25% wider than the
+  // 312.0 kHz was inherited, not measured, and it is 25% wider than the
   // 250 kHz the SX1276 uses for T1, so it admits ~1.2 dB of noise the signal
-  // does not need. `sx1262_rx_bandwidth` exists to settle that on hardware.
+  // does not need. Settled on hardware 2026-11-12/13, same hours (07:30-11:30)
+  // on two working days, LR1121 on a splitter as the reference (2796 vs 2792
+  // emissions/h): a T-Beam on the splitter caught 52.5% of the LR1121's
+  // -110..-105 dBm frames at 234 kHz against 30.6% at 312 kHz, 18.4% against
+  // 3.4% below -110, meters 0.84 against 0.76 of the LR1121's; a Heltec gained
+  // at -105..-100 (33% against 26%), a XIAO a little; strong frames lost
+  // nothing. C1 in `both` gained too (T-Beam 77% of the LR1121's C1 frames
+  // against 60%). So 234 kHz is the default since 2026-11-15; 312khz stays
+  // selectable.
   // Scope, exactly: only `listen_mode: s1` ignores this and keeps its measured
   // 234.3 kHz. t1, both and c1 follow the setting.
   //
@@ -1464,7 +1528,10 @@ void SX1262::setup() {
   // Techem C1 meters an SX1276 decoded every ~245 s: two SX1262 boards (Heltec
   // V4.2, XIAO) in `c1` at 234.3 kHz decoded none of them over several minutes,
   // one CRC failure between them, while the Heltec in `both` at 312 kHz did
-  // decode C1. The SX1276 reaches C1 through AFC over 250 kHz; the SX1262 has
+  // decode C1. That run predates the fix of 2026-09-30 that stopped c1/both
+  // arming on 0x54CD every fourth time; after it, 234 kHz did better on C1
+  // than 312 kHz (see the T1 note above), so the 09-25 result is not one
+  // about the filter. The SX1276 reaches C1 through AFC over 250 kHz; the SX1262 has
   // no AFC in GFSK, so the filter alone has to absorb the meter's frequency
   // offset on top of a ~190 kHz Carson bandwidth.
   uint8_t rx_bw = GFSK_RX_BW_234_3;
