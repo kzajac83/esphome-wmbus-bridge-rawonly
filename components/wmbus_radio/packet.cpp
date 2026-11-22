@@ -16,6 +16,9 @@
 #include "decode3of6.h"
 // Lightweight DLL CRC validation/removal helpers (EN13757 CRC16)
 #include "dll_crc.h"
+// Frame-length bounds and the format-A block count, shared with the stream
+// capture length helpers so both layers size a frame the same way.
+#include "frame_length.h"
 
 #define WMBUS_PREAMBLE_SIZE (3)
 #define WMBUS_MODE_C_SUFIX_LEN (2)
@@ -175,9 +178,9 @@ size_t Packet::expected_size() {
     auto l_field = this->l_field();
     if (l_field == 0) return 0;
 
-    // Number of blocks (format A/B framing rules)
-    auto nrBlocks = l_field < 26 ? 2 : (l_field - 26) / 16 + 3;
-    auto nrBytes = l_field + 1 + 2 * nrBlocks;
+    // Number of blocks (format A framing rules; format B uses L directly below)
+    const size_t nrBlocks = format_a_block_count(l_field);
+    const size_t nrBytes = (size_t) l_field + 1 + 2 * nrBlocks;
 
     if (this->link_mode() != LinkMode::C1) {
       this->expected_size_ = encoded_size(nrBytes);
@@ -206,8 +209,8 @@ void Packet::resize(size_t len) {
 
 // Helpers for DLL size calculation
 static inline size_t blocks_for_l_(uint8_t l_field) {
-  // EN13757-3: number of blocks depends on L-field
-  return (l_field < 26) ? 2 : (size_t) ((l_field - 26) / 16 + 3);
+  // EN13757-3: number of blocks depends on L-field (L = 9 is block 1 alone)
+  return format_a_block_count(l_field);
 }
 
 static inline size_t total_len_format_a_with_crc_(uint8_t l_field) {
@@ -326,7 +329,7 @@ static ParseAttemptResult try_parse_t1_(const std::vector<uint8_t> &raw) {
   out.want_len = need_total;
   out.got_len = out.data.size();
 
-  if (want < 12 || want > 260) {
+  if (want < WMBUS_MIN_FRAME_LEN_FORMAT_A || want > 260) {
     char detail[128];
     snprintf(detail, sizeof(detail), "l_field=%u decoded_len=%u want=%u need_total=%u",
              (unsigned) l, (unsigned) out.decoded_len, (unsigned) want, (unsigned) need_total);
@@ -415,7 +418,8 @@ static ParseAttemptResult try_parse_c1_(const std::vector<uint8_t> &raw) {
   out.want_len = need_total;
   out.got_len = out.data.size();
 
-  if (want < 12 || want > 260) {
+  const size_t min_want = (out.frame_format == "A") ? WMBUS_MIN_FRAME_LEN_FORMAT_A : WMBUS_MIN_FRAME_LEN_FORMAT_B;
+  if (want < min_want || want > 260) {
     char detail[144];
     snprintf(detail, sizeof(detail), "format=%s l_field=%u decoded_len=%u want=%u need_total=%u",
              out.frame_format.c_str(), (unsigned) l, (unsigned) out.decoded_len,
@@ -650,7 +654,7 @@ static ParseAttemptResult try_parse_s1_(const std::vector<uint8_t> &raw) {
     out.want_len = need_total;
     out.got_len = out.data.size();
 
-    if (want < 12 || want > 260) {
+    if (want < WMBUS_MIN_FRAME_LEN_FORMAT_A || want > 260) {
       char detail[160];
       snprintf(detail, sizeof(detail), "bit_offset=%u polarity=%d l_field=%u decoded_len=%u want=%u need_total=%u symbols_invalid=%u",
                (unsigned) bit_offset, pol, (unsigned) l, (unsigned) out.decoded_len, (unsigned) want,

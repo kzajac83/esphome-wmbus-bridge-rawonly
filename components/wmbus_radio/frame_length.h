@@ -23,6 +23,32 @@
 namespace esphome {
 namespace wmbus_radio {
 
+// Shortest link layer each frame format can carry, as L + 1 (the L-field
+// counted with the bytes it announces). Shared by every parser and length
+// helper, so a frame the length helpers size is a frame the parsers accept.
+//
+// Format A: L counts neither itself nor the CRCs. L = 9 is the DLL header
+// alone (C, M, A) and fits in block 1; L = 10 adds the CI field. Both are
+// real frames - a link-layer ACK or SND_NKE carries nothing more - and a
+// two-way (T2) exchange is where they turn up. The old bound of 12 dropped
+// them as "l_field_invalid" before CRC was ever checked.
+//
+// Format B: L includes the CRC, so the header plus its 2-byte CRC is L = 11
+// and the old bound stays.
+static constexpr size_t WMBUS_MIN_FRAME_LEN_FORMAT_A = 10U;
+static constexpr size_t WMBUS_MIN_FRAME_LEN_FORMAT_B = 12U;
+
+// Format A block layout: block 1 carries L and the 9 header bytes after it,
+// every further block up to 16 bytes, each followed by a 2-byte CRC. A frame
+// with L = 9 is block 1 alone. Counting two blocks for it would make the
+// receiver read three raw bytes of post-frame noise, and a single invalid
+// 3-of-6 symbol among them fails the whole T1 decode.
+inline size_t format_a_block_count(uint8_t l_field) {
+  if (l_field <= 9U)
+    return 1U;
+  return (l_field < 26U) ? 2U : (size_t) ((l_field - 26U) / 16U + 3U);
+}
+
 // One Manchester pair at absolute chip index `chip` in raw. Returns false when
 // the pair is 00 or 11, which encodes nothing.
 inline bool manchester_chip_pair(const std::vector<uint8_t> &raw, size_t chip, bool polarity, uint8_t &bit_out) {
@@ -66,7 +92,7 @@ inline size_t expected_raw_len_s1(const std::vector<uint8_t> &raw) {
       continue;
 
     const size_t frame_len = (size_t) l_field + 1U;
-    if (frame_len < 12U || frame_len > 260U)
+    if (frame_len < WMBUS_MIN_FRAME_LEN_FORMAT_A || frame_len > 260U)
       continue;
 
     // C-field, raw bytes 2-3. Up to two invalid pairs tolerated, and only the
@@ -100,8 +126,7 @@ inline size_t expected_raw_len_s1(const std::vector<uint8_t> &raw) {
     if ((c_bits & c_mask) != (0x44U & c_mask) && (c_bits & c_mask) != (0x46U & c_mask))
       continue;
 
-    const size_t blocks = (l_field < 26U) ? 2U : (size_t) ((l_field - 26U) / 16U + 3U);
-    const size_t decoded_with_crc = frame_len + 2U * blocks;
+    const size_t decoded_with_crc = frame_len + 2U * format_a_block_count(l_field);
     return decoded_with_crc * 2U;
   }
   return 0;
@@ -158,15 +183,14 @@ inline size_t expected_raw_len_t1(const std::vector<uint8_t> &raw) {
 
   const uint8_t l_field = (*decoded)[0];
   const size_t frame_len = (size_t) l_field + 1U;
-  // Same bounds as the S-mode helper: under 12 there is no room for a DLL
+  // Same bounds as the S-mode helper: under 10 there is no room for a DLL
   // header, over 260 no wM-Bus frame exists.
-  if (frame_len < 12U || frame_len > 260U)
+  if (frame_len < WMBUS_MIN_FRAME_LEN_FORMAT_A || frame_len > 260U)
     return 0;
 
   // Format A block layout, identical in both modes: block 1 carries 10 bytes,
   // every further block 16, each followed by a 2-byte CRC.
-  const size_t blocks = (l_field < 26U) ? 2U : (size_t) ((l_field - 26U) / 16U + 3U);
-  const size_t decoded_with_crc = frame_len + 2U * blocks;
+  const size_t decoded_with_crc = frame_len + 2U * format_a_block_count(l_field);
   return encoded_size(decoded_with_crc);
 }
 
@@ -187,16 +211,20 @@ inline size_t expected_raw_len_c1(const std::vector<uint8_t> &raw) {
 
   const uint8_t l_field = raw[2];
   const size_t frame_len = (size_t) l_field + 1U;
-  // Same bounds as the other two helpers.
-  if (frame_len < 12U || frame_len > 260U)
+  // Same bounds as the other two helpers, per format.
+  if (frame_len > 260U)
     return 0;
 
   if (raw[1] == 0xCDU) {  // format A: full block layout with its CRCs
-    const size_t blocks = (l_field < 26U) ? 2U : (size_t) ((l_field - 26U) / 16U + 3U);
-    return 2U + frame_len + 2U * blocks;
+    if (frame_len < WMBUS_MIN_FRAME_LEN_FORMAT_A)
+      return 0;
+    return 2U + frame_len + 2U * format_a_block_count(l_field);
   }
-  if (raw[1] == 0x3DU)    // format B: CRCs already counted inside the L-field
+  if (raw[1] == 0x3DU) {  // format B: CRCs already counted inside the L-field
+    if (frame_len < WMBUS_MIN_FRAME_LEN_FORMAT_B)
+      return 0;
     return 2U + 1U + (size_t) l_field;
+  }
   return 0;
 }
 

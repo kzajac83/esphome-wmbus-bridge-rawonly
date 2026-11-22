@@ -629,6 +629,96 @@ static void test_real_golden_frames_round_trip() {
   }
 }
 
+// Shortest link layers: L = 9 is the DLL header alone (C, M, A), L = 10 adds
+// the CI byte. A two-way exchange uses them (link-layer ACK 0x00, SND_NKE
+// 0x40); the parsers used to drop them as l_field_invalid. Synthetic address
+// 12345678, not a capture.
+static std::vector<uint8_t> short_frame_body(uint8_t l_field) {
+  std::vector<uint8_t> body = {l_field, 0x00, 0x01, 0x06, 0x78, 0x56, 0x34, 0x12, 0x01, 0x07};
+  if (l_field >= 10) body.push_back(0x8A);
+  return body;
+}
+
+static void check_short_frame(std::optional<Frame> frame, const std::vector<uint8_t> &body,
+                              LinkMode mode, const std::string &what) {
+  check(frame.has_value(), what + " converts to a frame");
+  if (!frame) return;
+  check(frame->link_mode() == mode, what + " keeps its link mode");
+  check(frame->as_raw() == body, what + " strips coding and DLL CRC exactly");
+  uint32_t meter_id = 0;
+  check(frame->try_get_meter_id(meter_id), what + " meter id is extractable");
+  check(meter_id == 12345678U, what + " meter id value");
+}
+
+static void test_packet_short_frames_are_accepted() {
+  for (uint8_t l_field : {(uint8_t) 9, (uint8_t) 10}) {
+    const auto body = short_frame_body(l_field);
+    const auto with_crc = format_a_with_crc_from_body(body);
+    const std::string l_name = "L=" + std::to_string((unsigned) l_field);
+    // One CRC for L = 9 (block 1 alone), two for L = 10.
+    check(with_crc.size() == body.size() + (l_field == 9 ? 2U : 4U), l_name + " fixture block layout");
+
+    Packet t1 = make_packet(encode_3of6(with_crc), -70);
+    check_short_frame(t1.convert_to_frame(), body, LinkMode::T1, "T1 " + l_name);
+
+    std::vector<uint8_t> c1_raw = {0x54, 0xCD};
+    c1_raw.insert(c1_raw.end(), with_crc.begin(), with_crc.end());
+    Packet c1 = make_packet(c1_raw, -70);
+    check_short_frame(c1.convert_to_frame(), body, LinkMode::C1, "C1 format A " + l_name);
+
+    Packet s1 = make_packet(encode_s1_manchester(with_crc), -70, LinkMode::S1);
+    check_short_frame(s1.convert_to_frame(), body, LinkMode::S1, "S1 " + l_name);
+
+    // The S1 receive path drains a fixed window, so the frame arrives followed
+    // by post-frame noise; the parser must cut at the frame's own length.
+    auto s1_noisy = encode_s1_manchester(with_crc);
+    for (int i = 0; i < 40; i++) s1_noisy.push_back((uint8_t) (0x3C ^ (i * 37)));
+    Packet s1n = make_packet(s1_noisy, -70, LinkMode::S1);
+    check_short_frame(s1n.convert_to_frame(), body, LinkMode::S1, "S1 " + l_name + " followed by noise");
+  }
+}
+
+static void test_packet_short_frame_expected_size() {
+  // The T1 receive path reads exactly expected_size() raw bytes. For L = 9
+  // that must be block 1 alone: 12 decoded bytes, 18 raw. The old two-block
+  // count asked for 21, three bytes of post-frame noise that fail the 3-of-6
+  // decode as a whole.
+  Packet l9 = make_packet(encode_3of6(format_a_with_crc_from_body(short_frame_body(9))), -70);
+  check(l9.expected_size() == 18U, "T1 L=9 expected_size is 18 raw bytes");
+  Packet l10 = make_packet(encode_3of6(format_a_with_crc_from_body(short_frame_body(10))), -70);
+  check(l10.expected_size() == encoded_size(15), "T1 L=10 expected_size is 15 decoded bytes");
+
+  std::vector<uint8_t> c1_raw = {0x54, 0xCD};
+  const auto c1_body = format_a_with_crc_from_body(short_frame_body(9));
+  c1_raw.insert(c1_raw.end(), c1_body.begin(), c1_body.end());
+  Packet c1 = make_packet(c1_raw, -70);
+  check(c1.expected_size() == 14U, "C1 format A L=9 expected_size is suffix + 12");
+}
+
+static void test_packet_too_short_frames_are_still_rejected() {
+  // L = 8 cannot hold the 6-byte address: still l_field_invalid, before CRC.
+  std::vector<uint8_t> l8 = short_frame_body(9);
+  l8[0] = 0x08;
+  append_crc(l8, 0, 10);
+  Packet t1 = make_packet(encode_3of6(l8), -70);
+  check(!t1.convert_to_frame().has_value(), "T1 L=8 is rejected");
+  check(t1.drop_stage() == "t1_l_field", "T1 L=8 reports t1_l_field");
+  check(t1.drop_reason() == "l_field_invalid", "T1 L=8 reports l_field_invalid");
+
+  Packet s1 = make_packet(encode_s1_manchester(l8), -70, LinkMode::S1);
+  check(!s1.convert_to_frame().has_value(), "S1 L=8 is rejected");
+
+  // Format B counts its CRC inside L, so the header plus CRC is L = 11 and
+  // the old bound stays: L = 10 is no frame at all.
+  std::vector<uint8_t> b_raw = {0x54, 0x3D};
+  std::vector<uint8_t> b_body = short_frame_body(10);
+  append_crc(b_body, 0, b_body.size());
+  b_raw.insert(b_raw.end(), b_body.begin(), b_body.end());
+  Packet c1b = make_packet(b_raw, -70);
+  check(!c1b.convert_to_frame().has_value(), "C1 format B L=10 is rejected");
+  check(c1b.drop_stage() == "c1_l_field", "C1 format B L=10 reports c1_l_field");
+}
+
 int main() {
   test_rx_metadata_primitives();
   test_decode3of6_round_trip();
@@ -649,6 +739,9 @@ int main() {
   test_non_bcd_meter_id();
   test_forward_meter_whitelist();
   test_real_golden_frames_round_trip();
+  test_packet_short_frames_are_accepted();
+  test_packet_short_frame_expected_size();
+  test_packet_too_short_frames_are_still_rejected();
 
   if (failures == 0) {
     std::cout << "All host parser tests passed\n";

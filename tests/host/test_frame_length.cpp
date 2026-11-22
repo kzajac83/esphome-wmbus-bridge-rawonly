@@ -126,6 +126,44 @@ int main() {
     CHECK_EQ(raw_len_undecidable_c1_or_t1(empty, true), false);
   }
 
+  // --- Shortest link layers: L=9 (header only) and L=10 (header + CI) --------
+  // Must size exactly as Packet::expected_size() does, block 1 alone for L=9.
+  {
+    CHECK_EQ(format_a_block_count(9), (size_t) 1);
+    CHECK_EQ(format_a_block_count(10), (size_t) 2);
+    CHECK_EQ(format_a_block_count(25), (size_t) 2);
+    CHECK_EQ(format_a_block_count(26), (size_t) 3);
+    CHECK_EQ(format_a_block_count(0x9B), blocks_a(0x9B));
+
+    const auto t1_l9 = encode3of6({0x09, 0x00});
+    CHECK_EQ(expected_raw_len_t1(t1_l9), encoded_size(12));
+    CHECK_EQ(expected_raw_len_t1(t1_l9), (size_t) 18);
+    const auto t1_l10 = encode3of6({0x0A, 0x40});
+    CHECK_EQ(expected_raw_len_t1(t1_l10), encoded_size(15));
+    const auto t1_l8 = encode3of6({0x08, 0x00});
+    CHECK_EQ(expected_raw_len_t1(t1_l8), (size_t) 0);
+    CHECK_EQ(raw_len_undecidable_c1_or_t1(t1_l8, true), true);
+
+    std::vector<uint8_t> c1a_l9 = {0x54, 0xCD, 0x09};
+    CHECK_EQ(expected_raw_len_c1_or_t1(c1a_l9, true), (size_t) (2 + 10 + 2));
+    // Format B keeps its bound: L counts the CRC, so L=10 is no frame.
+    std::vector<uint8_t> c1b_l10 = {0x54, 0x3D, 0x0A};
+    CHECK_EQ(expected_raw_len_c1_or_t1(c1b_l10, true), (size_t) 0);
+    std::vector<uint8_t> c1b_l11 = {0x54, 0x3D, 0x0B};
+    CHECK_EQ(expected_raw_len_c1_or_t1(c1b_l11, true), (size_t) (2 + 1 + 0x0B));
+
+    // S1: Manchester 10 = 1, 01 = 0 (polarity false). L=9, C=0x44.
+    std::vector<uint8_t> s1;
+    for (uint8_t byte : {(uint8_t) 0x09, (uint8_t) 0x44}) {
+      uint16_t chips = 0;
+      for (int bit = 7; bit >= 0; bit--)
+        chips = (uint16_t) ((chips << 2) | ((((byte >> bit) & 1) != 0) ? 0x2 : 0x1));
+      s1.push_back((uint8_t) (chips >> 8));
+      s1.push_back((uint8_t) (chips & 0xFF));
+    }
+    CHECK_EQ(expected_raw_len_s1(s1), (size_t) ((10 + 2) * 2));
+  }
+
   if (failures) {
     std::printf("%d failure(s)\n", failures);
     return EXIT_FAILURE;

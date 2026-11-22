@@ -1204,7 +1204,10 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
   else if (d.size() >= 9)
     base = 0;
 
-  if (base >= 0 && (int) d.size() >= base + 10) {
+  // C, M(2), A(6) take 9 bytes after `base`; the CI byte after them is
+  // optional. A header-only frame (L = 9: link-layer ACK, SND_NKE) still has a
+  // full address and must not be logged or filtered as an unknown meter.
+  if (base >= 0 && (int) d.size() >= base + 9) {
     uint16_t m = (uint16_t) d[base + 1] | ((uint16_t) d[base + 2] << 8);
     decode_mfr(m, mfr_buf);
     mfr = mfr_buf;
@@ -1234,7 +1237,8 @@ if (!this->boot_log_done_ && this->radio != nullptr) {
 
     ver = d[base + 7];
     dev = d[base + 8];
-    ci = d[base + 9];
+    if ((int) d.size() >= base + 10)
+      ci = d[base + 9];
   }
 
   const bool highlight = meter_id_in_lists(this->highlight_meter_ids_, this->highlight_meter_raw_ids_,
